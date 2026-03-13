@@ -1,0 +1,105 @@
+{
+  "projectType": "general",
+  "projectName": "Kamakiri",
+  "projectDescription": "A bootrom exploit for MediaTek devices enabling device unlock and custom firmware installation",
+  "theme": "aspen",
+  "primaryColor": "#FF6B35",
+  "lightColor": "#FFB84D",
+  "darkColor": "#C94B1F",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Getting Started",
+            "pages": [
+              "getting-started/prerequisites",
+              "getting-started/installation",
+              "getting-started/quickstart"
+            ]
+          },
+          {
+            "group": "Usage Guides",
+            "pages": [
+              "guides/device-preparation",
+              "guides/running-exploit",
+              "guides/bootloader-unlock",
+              "guides/custom-recovery"
+            ]
+          },
+          {
+            "group": "Technical Details",
+            "pages": [
+              "technical/architecture",
+              "technical/exploit-chain",
+              "technical/payload-stages",
+              "technical/supported-devices"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/building-payloads",
+              "advanced/troubleshooting",
+              "advanced/development"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python Modules",
+            "pages": [
+              "api/device",
+              "api/payload-loader",
+              "api/functions"
+            ]
+          },
+          {
+            "group": "Payload Components",
+            "pages": [
+              "api/stage1",
+              "api/stage2",
+              "api/lk-payload",
+              "api/microloader"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-stage bootrom exploit for MediaTek devices",
+    "Device unlock and bootloader modification",
+    "RPMB downgrade for security bypass",
+    "Custom recovery installation (TWRP)",
+    "Fastboot mode access",
+    "eMMC read/write capabilities",
+    "Support for Amazon Fire tablets (Mantis/Karnak)"
+  ],
+  "publicApiSurface": [
+    "Device.handshake()",
+    "Device.read32(addr, size)",
+    "Device.write32(addr, words)",
+    "Device.emmc_read(idx)",
+    "Device.emmc_write(idx, data)",
+    "Device.rpmb_read()",
+    "Device.rpmb_write(data)",
+    "Device.reboot()",
+    "load_payload(dev)",
+    "load_pl_payload(dev)",
+    "bootrom-step.sh",
+    "fastboot-step.sh",
+    "boot-recovery.sh"
+  ]
+}

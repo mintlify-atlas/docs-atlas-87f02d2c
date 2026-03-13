@@ -1,0 +1,303 @@
+---
+title: System Architecture
+description: Overall system architecture, component relationships, and data flow in the Kamakiri exploit
+---
+
+## Overview
+
+Kamakiri is a bootrom exploit for MediaTek MT8163/MT8173 chipsets that achieves arbitrary code execution at the earliest boot stage. The exploit leverages vulnerabilities in the device's Boot ROM (BROM) to gain control before secure boot verification occurs.
+
+## Architecture Components
+
+The Kamakiri exploit consists of five main components that work together in a staged exploitation chain:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    USB Host (PC)                        │
+│            Python Exploit Framework                     │
+└──────────────────┬──────────────────────────────────────┘
+                   │ USB Serial (VID:0x0e8d, PID:0x0003)
+                   ▼
+┌─────────────────────────────────────────────────────────┐
+│              MediaTek Device Boot Flow                  │
+│                                                         │
+│  BootROM → Stage1 → Stage2 → Preloader → LK → Kernel   │
+│  0x0000    0x200C0   0x201000  0x201000   0x41E00000    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Component Breakdown
+
+#### 1. Python Exploit Framework
+
+**Location:** `modules/`
+
+The Python framework handles device communication and exploit orchestration:
+
+- **`common.py`**: Device class implementing MediaTek BROM serial protocol
+- **`load_payload.py`**: Core exploit trigger and payload loading logic
+- **`main.py`**: High-level exploit flow and device-specific operations
+
+**Key Protocol Commands:**
+
+```python
+# BROM Protocol Commands
+0xD1 - Read memory (read32)
+0xD4 - Write memory (write32)
+0xD7 - Send Download Agent (DA)
+0xD5 - Jump to DA address
+0xC8 - Run extended command
+```
+
+#### 2. Stage 1 Payload (BROM Context)
+
+**Location:** `brom-payload/stage1.c` → `stage1.bin`
+
+**Load Address:** `0x200C0` (within BROM SRAM)
+
+**Size Limit:** 0xA00 bytes (2560 bytes max)
+
+**Execution Context:** Running inside BootROM with full hardware access
+
+**Purpose:**
+- Establish initial code execution in BROM context
+- Send confirmation pattern `0xA1A2A3A4` to host
+- Implement basic command loop for memory operations
+- Load and execute Stage 2 payload
+
+#### 3. Stage 2 Payload (Extended BROM)
+
+**Location:** `brom-payload/stage2.c` → `stage2.bin`
+
+**Load Address:** `0x201000` (SRAM)
+
+**Purpose:**
+- Initialize eMMC controller (MSDC)
+- Provide full eMMC read/write capabilities
+- Implement RPMB operations for rollback protection
+- Support IDME partition access
+
+#### 4. Preloader Payload
+
+**Location:** `brom-payload/pl.c` → `pl.bin`
+
+**Load Address:** `0x40001000`
+
+**Purpose:**
+- Alternative entry point when device boots to preloader mode
+- Pattern matching to locate preloader functions
+- Re-initialize eMMC from preloader context
+
+#### 5. LK (Little Kernel) Payload
+
+**Location:** `lk-payload/main.c` → `payload.bin`
+
+**Install Location:** Boot0 partition at offset `0x80000` (512KB)
+
+**Load Address:** `0x41000000`
+
+**Execution Context:** Called by microloader before LK boots
+
+**Purpose:**
+- Hook bootloader functions
+- Parse GPT to locate boot/recovery/lk partitions
+- Implement boot mode manipulation
+- Enable fastboot/recovery modes
+- Bypass security checks
+
+#### 6. Microloader
+
+**Location:** `microloader/main.c` → `microloader.bin`
+
+**Install Location:** Boot partition header (first 0x400 bytes)
+
+**Purpose:**
+- Minimal bootloader stage
+- Load LK payload from Boot0 partition
+- Jump to LK payload before normal LK execution
+
+## Memory Map
+
+### Critical Memory Regions
+
+| Address | Size | Description |
+|---------|------|-------------|
+| `0x00000000` | - | BootROM (read-only) |
+| `0x00200000` | 128KB | BROM internal SRAM |
+| `0x0020_0C00` | ~2KB | Stage1 payload injection point |
+| `0x00201000` | ~64KB | Stage2 payload location |
+| `0x10007000` | - | Watchdog Timer (WDT) registers |
+| `0x10210000` | - | Crypto engine base (Karnak) |
+| `0x11003000` | - | UART0 registers |
+| `0x40001000` | - | Preloader payload load address |
+| `0x41000000` | 512KB | LK payload execution address |
+| `0x41E00000` | 1MB | LK (Little Kernel) base address |
+| `0x41E00020` | - | LK argument pointer |
+| `0x41E5544C` | 4B | Global boot mode flag |
+| `0x45000000` | - | Temporary staging area |
+
+### Watchdog Register Operations
+
+```c
+// Watchdog base: 0x10007000
+*WDT_MODE (0x10007000) = 0x22000000;  // Disable watchdog
+*WDT_RESTART (0x10007008) = 0x1971;   // Kick watchdog
+*WDT_SWRST (0x10007014) = 0x1209;     // Software reset
+```
+
+## eMMC Partition Layout
+
+### Boot0 Partition (Boot Area 1)
+
+| Offset | Size | Content |
+|--------|------|----------|
+| `0x00000` | 0x80000 | Preloader |
+| `0x80000` | 0x80000 | LK Payload |
+| `0x200000` | 0x80000 | LK Payload Backup |
+
+### User Partition
+
+| Partition | Purpose | Modified by Exploit |
+|-----------|---------|---------------------|
+| lk | Little Kernel bootloader | ✓ Downgraded |
+| tee1 | TrustZone trusted execution environment | ✓ Downgraded |
+| boot | Android boot image | ✓ Microloader injected |
+| recovery | Recovery boot image | - |
+| MISC | Boot control flags | ✓ Boot mode flags |
+
+### Boot0 Partition (Hardware)
+
+```
+Partition 1 (BOOT0_PART): Boot area with preloader and payloads
+Partition 2: IDME (Amazon ID ME) configuration data
+Partition 8 (USER_PART): Main user data area with GPT
+```
+
+## Data Flow
+
+### Exploit Phase
+
+```
+1. USB Connection
+   └─> Host detects MediaTek device (VID:0x0e8d, PID:0x0003)
+
+2. BROM Handshake
+   └─> 4-byte sequence: 0xa0/0x5f, 0x0a/0xf5, 0x50/0xaf, 0x05/0xfa
+
+3. Watchdog Control
+   └─> Write 0x22000000 to 0x10007000 (disable)
+   └─> Periodic write 0x1971 to 0x10007008 (kick)
+
+4. Vulnerability Trigger
+   └─> Write 0xA1000 to 0x10007050 (watchdog register manipulation)
+   └─> USB control transfer: ctrl_transfer(0xA1, 0, 0, 10, 0)
+   └─> BROM vulnerability triggered
+
+5. Stage1 Injection
+   └─> Send 0xE0 command
+   └─> Send size 0xA00
+   └─> Upload stage1.bin to BROM SRAM
+   └─> Wait for magic: 0xA1A2A3A4
+
+6. Stage2 Loading
+   └─> Send magic 0xf00dd00d
+   └─> Send command 0x4000 (write memory)
+   └─> Write stage2.bin to 0x201000
+   └─> Send command 0x4001 (jump)
+   └─> Stage2 initializes eMMC and enters command loop
+
+7. Full System Control
+   └─> Python framework now has:
+       • eMMC read/write access
+       • RPMB manipulation
+       • Memory read/write
+       • Device reboot control
+```
+
+### Boot Interception Flow
+
+```
+1. Device powers on
+   └─> BootROM loads preloader from Boot0
+
+2. Preloader executes
+   └─> Loads LK from user partition
+
+3. Microloader intercepts (injected in boot partition header)
+   └─> Loads LK payload from Boot0:0x80000
+   └─> Jumps to 0x41000000 (LK payload)
+
+4. LK Payload executes
+   └─> Parse GPT for partition offsets
+   └─> Check boot flags (MISC partition, y_cable, boot_reason)
+   └─> Hook LK read() function
+   └─> Restore LK memory (0x41E00200-0x41E01200)
+   └─> Patch security checks
+   └─> Jump to original LK at 0x41E25371
+
+5. Hooked LK read() redirects boot/recovery reads
+   └─> Skip first 0x400 bytes (microloader)
+   └─> Return actual kernel from offset 0x400
+   └─> Device boots normally with unlocked bootloader
+```
+
+## Communication Protocol
+
+### Stage1 Protocol
+
+```c
+// Magic: 0xf00dd00d (food dood)
+// Commands:
+0x4000: Write memory (address, size, data) → 0xD0D0D0D0 on success
+0x4001: Jump to address
+0x3000: Reboot device
+0x3001: Kick watchdog
+```
+
+### Stage2/PL Protocol (Extended)
+
+Inherits Stage1 commands plus:
+
+```c
+0x1000: Read eMMC block → 0x200 bytes
+0x1001: Write eMMC block (0x200 bytes) → 0xD0D0D0D0
+0x1002: Switch eMMC partition
+0x2000: Read RPMB (0x100 bytes)
+0x2001: Write RPMB (0x100 bytes)
+0x5000: Read memory (address, size)
+0x7000: Read IDME field (16-byte name)
+```
+
+## Security Implications
+
+### Bypassed Security Features
+
+1. **Secure Boot**: Executed before signature verification
+2. **Bootloader Lock**: LK patches enable all fastboot commands
+3. **RPMB Rollback Protection**: Can be zeroed out
+4. **Device Lock State**: `amzn_verify_unlock()` patched to return 0
+
+### Persistence Mechanism
+
+The exploit installs persistent hooks that survive reboots:
+
+- **Microloader** in boot partition (transparent to OS)
+- **LK Payload** in Boot0 partition (hardware boot area)
+- **Backup payload** at Boot0:0x200000 (redundancy)
+- **Downgraded LK/TZ** vulnerable versions
+
+## Device-Specific Adaptations
+
+The exploit checks device identity via IDME:
+
+```python
+device_type_id = dev.idme_read(b"device_type_id")
+if device_type_id == "AKPGW064GI9HE":  # Mantis device
+    # Load device-specific binaries
+```
+
+Device-specific components:
+- GPT layout (`../bin/gpt-mantis.bin`)
+- TrustZone image (`../bin/tz.img`)
+- LK binary (`../bin/lk.bin`)
+- Preloader (`../bin/preloader.img`)

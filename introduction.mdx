@@ -1,0 +1,140 @@
+---
+title: Introduction
+description: A bootrom exploit for MediaTek devices enabling device unlock and custom firmware installation
+---
+
+<img
+  className="block dark:hidden"
+  src="/images/hero-light.svg"
+  alt="Kamakiri Hero Light"
+/>
+<img
+  className="hidden dark:block"
+  src="/images/hero-dark.svg"
+  alt="Kamakiri Hero Dark"
+/>
+
+## What is Kamakiri?
+
+Kamakiri is a powerful bootrom exploit for MediaTek devices that enables device unlock and custom firmware installation. Originally developed for Amazon Fire tablets (Mantis/Karnak), this exploit leverages vulnerabilities in the MediaTek bootrom to achieve complete control over the device's boot process.
+
+The exploit uses a multi-stage payload system to progressively gain control of the device, ultimately enabling:
+
+- **Bootloader unlock** without manufacturer authorization
+- **Custom recovery installation** (TWRP support)
+- **RPMB downgrade** for security bypass
+- **Fastboot mode access** for advanced operations
+- **Direct eMMC read/write** capabilities
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card
+    title="Multi-Stage Exploitation"
+    icon="layer-group"
+    href="/technical/exploit-chain"
+  >
+    Progressive payload deployment through bootrom, stage1, stage2, and LK stages
+  </Card>
+  <Card
+    title="Device Unlock"
+    icon="unlock"
+    href="/guides/bootloader-unlock"
+  >
+    Unlock MediaTek devices without manufacturer authorization
+  </Card>
+  <Card
+    title="Custom Recovery"
+    icon="screwdriver-wrench"
+    href="/guides/custom-recovery"
+  >
+    Install TWRP and other custom recovery images
+  </Card>
+  <Card
+    title="Low-Level Access"
+    icon="microchip"
+    href="/api/device"
+  >
+    Direct eMMC, RPMB, and memory access via Python API
+  </Card>
+</CardGroup>
+
+## How It Works
+
+Kamakiri exploits vulnerabilities in the MediaTek bootrom to execute unsigned code. The exploit chain consists of:
+
+1. **USB Handshake** - Establish communication with the device in bootrom mode
+2. **Stage 1 Payload** - Execute initial payload in bootrom context
+3. **Stage 2 Payload** - Load advanced payload with MMC/eMMC drivers
+4. **LK Payload** - Hook the Little Kernel bootloader
+5. **Microloader** - Persistent payload loader for boot-time modifications
+
+This multi-stage approach allows the exploit to progressively gain more control while working around memory and size constraints at each stage.
+
+<Card
+  title="Learn How It Works"
+  icon="book-open"
+  href="/how-it-works"
+>
+  Dive into the technical details of the exploit chain
+</Card>
+
+## Supported Devices
+
+Kamakiri currently supports Amazon Fire tablets with MediaTek processors, specifically:
+
+- **Amazon Fire HD 8 (7th Gen)** - Mantis (MT8163)
+- **Amazon Fire HD 8 (8th Gen)** - Karnak (MT8163)
+
+The exploit targets specific vulnerabilities in the MT8163 bootrom and may be adaptable to other MediaTek devices with similar bootrom implementations.
+
+<Warning>
+  **Use at Your Own Risk** - This exploit modifies critical boot components and eMMC partitions. Improper use can result in a bricked device. Always ensure you have proper backups and understand the risks before proceeding.
+</Warning>
+
+## Getting Started
+
+Ready to unlock your device? Follow our step-by-step guides:
+
+<CardGroup cols={2}>
+  <Card
+    title="Prerequisites"
+    icon="list-check"
+    href="/getting-started/prerequisites"
+  >
+    Required hardware, software, and device preparation
+  </Card>
+  <Card
+    title="Installation"
+    icon="download"
+    href="/getting-started/installation"
+  >
+    Install dependencies and build the exploit payloads
+  </Card>
+  <Card
+    title="Quick Start"
+    icon="rocket"
+    href="/getting-started/quickstart"
+  >
+    Run your first exploit and unlock your device
+  </Card>
+  <Card
+    title="Troubleshooting"
+    icon="wrench"
+    href="/advanced/troubleshooting"
+  >
+    Common issues and solutions
+  </Card>
+</CardGroup>
+
+## Community and Support
+
+Kamakiri is an open-source project developed by xyz and k4y0z. For issues, contributions, and community support:
+
+- **GitHub Repository**: [amonet-kamakiri/kamakiri](https://github.com/amonet-kamakiri/kamakiri)
+- **Issues & Bug Reports**: Use the GitHub issue tracker
+- **Contributions**: Pull requests are welcome
+
+<Note>
+  This documentation covers both the exploit framework and the underlying technical implementation. Whether you're a user looking to unlock your device or a developer interested in the internals, you'll find detailed information throughout this guide.
+</Note>

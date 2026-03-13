@@ -1,0 +1,798 @@
+---
+title: Payload Stages
+description: Deep technical dive into each payload stage implementation
+---
+
+## Payload Architecture
+
+Kamakiri uses a multi-stage payload architecture where each stage enables capabilities for the next. This design is necessary due to size constraints and progressive access to hardware peripherals.
+
+## Stage 1: BROM Payload
+
+### Overview
+
+**Source:** `brom-payload/stage1.c`
+
+**Binary:** `stage1.bin`
+
+**Load Address:** Injected into BROM SRAM via vulnerability
+
+**Size Limit:** 0xA00 (2560) bytes maximum
+
+**Execution Context:** BootROM address space with SRAM access
+
+### Implementation
+
+<Tabs>
+  <Tab title="Entry Point">
+```c
+int main() {
+    print("Entered 1ST stage payload\n");
+    print("Copyright xyz, k4y0z 2019\n");
+
+    // This is so we don't get a USB-Timeout
+    print("Send USB response\n");
+    send_usb_response(0,0,1);
+
+    print("Entering command loop\n");
+    send_dword(0xA1A2A3A4);  // Confirmation magic
+
+    while (1) {
+        uint32_t magic = recv_dword();
+        if (magic != 0xf00dd00d) {
+            print("Protocol error\n");
+            break;
+        }
+        uint32_t cmd = recv_dword();
+        // Handle commands...
+    }
+}
+```
+
+From `brom-payload/stage1.c:14-32`
+  </Tab>
+  
+  <Tab title="Memory Write">
+```c
+case 0x4000: {  // Write memory command
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    print("Write\n");
+    
+    if(recv_data(address, size, 0) == 0) {
+        print("OK\n");
+        send_dword(0xD0D0D0D0);  // Success
+    } else {
+        send_dword(0xF0F0F0F0);  // Failure
+        print("Read fail\n");
+    }
+    break;
+}
+```
+
+From `brom-payload/stage1.c:35-48`
+  </Tab>
+  
+  <Tab title="Jump Command">
+```c
+case 0x4001: {  // Jump to address
+    void (*jump_address)(void) = (void*) recv_dword();
+    print("Jump\n");
+    jump_address();  // Transfer control
+    break;
+}
+```
+
+From `brom-payload/stage1.c:50-55`
+  </Tab>
+  
+  <Tab title="Watchdog Control">
+```c
+case 0x3001: {  // Kick watchdog
+    print("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;  // WDT_RESTART register
+    break;
+}
+
+case 0x3000: {  // Reboot
+    print("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;    // Kick watchdog
+    reg[0/4] = 0x22000014; // Enable and trigger
+    reg[0x14/4] = 0x1209;  // Software reset
+    while (1) { }  // Wait for reset
+}
+```
+
+From `brom-payload/stage1.c:68-73`, `57-66`
+  </Tab>
+</Tabs>
+
+### BROM Function Pointers
+
+Stage1 leverages existing BROM functions:
+
+```c
+// From brom_common.c - Hard-coded addresses in BROM
+void (*send_usb_response)(int, int, int) = (void*)0x55bb;
+int (*send_dword)() = (void*)0xBE09;
+int (*recv_dword)() = (void*)0xBDD5;
+int (*send_data)() = (void*)0xBED1;  // addr, sz
+int (*recv_data)() = (void*)0xBE4B;  // addr, sz, flags (=0)
+```
+
+These addresses are specific to the MediaTek MT8163/MT8173 BootROM version.
+
+From `brom-payload/brom_common.c:3-10`
+
+### UART Output
+
+Stage1 implements basic UART for debugging:
+
+```c
+int print(char* s) {
+    char c = s[0];
+    int i = 0;
+    while(c) {
+        _putchar(c);  // UART output
+        c = s[++i];
+    }
+    return i;
+}
+```
+
+From `brom-payload/stage1.c:4-12`
+
+### Protocol Magic Numbers
+
+| Value | Purpose |
+|-------|----------|
+| `0xA1A2A3A4` | Stage1 ready confirmation |
+| `0xf00dd00d` | Protocol command magic ("food dood") |
+| `0xD0D0D0D0` | Command success |
+| `0xF0F0F0F0` | Command failure |
+
+## Stage 2: Extended BROM Payload
+
+### Overview
+
+**Source:** `brom-payload/stage2.c`
+
+**Binary:** `stage2.bin`
+
+**Load Address:** `0x201000` (SRAM)
+
+**Purpose:** Initialize eMMC controller and provide storage access
+
+### Implementation
+
+```c
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+
+    mmc_init(&host);  // Initialize MediaTek MSDC (eMMC controller)
+
+    command_loop(&host);  // Extended command protocol
+}
+```
+
+From `brom-payload/stage2.c:4-14`
+
+### Extended Command Loop
+
+<Tabs>
+  <Tab title="eMMC Read">
+```c
+case 0x1000: {  // Read eMMC block
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    memset(buf, 0, sizeof(buf));
+    
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, sizeof(buf));  // Send 0x200 bytes (512 bytes)
+    }
+    break;
+}
+```
+
+From `brom-payload/payload_common.c:61-70`
+  </Tab>
+  
+  <Tab title="eMMC Write">
+```c
+case 0x1001: {  // Write eMMC block
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    memset(buf, 0, sizeof(buf));
+    recv_data(buf, 0x200, 0);  // Receive 512 bytes
+    
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        printf("OK\n");
+        send_dword(0xD0D0D0D0);  // Success confirmation
+    }
+    break;
+}
+```
+
+From `brom-payload/payload_common.c:72-83`
+  </Tab>
+  
+  <Tab title="Partition Switch">
+```c
+case 0x1002: {  // Switch eMMC partition
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    ret = mmc_set_part(host, part);
+    printf("0x%08X\n", ret);
+    mdelay(500);  // Wait for partition switch to complete
+    break;
+}
+```
+
+Partition IDs:
+- `1` = Boot0 (BOOT0_PART)
+- `2` = IDME partition
+- `8` = User partition (USER_PART)
+
+From `brom-payload/payload_common.c:85-91`
+  </Tab>
+  
+  <Tab title="RPMB Access">
+```c
+case 0x2000: {  // Read RPMB
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);  // 256 bytes
+    break;
+}
+
+case 0x2001: {  // Write RPMB
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+RPMB (Replay Protected Memory Block) stores:
+- Rollback prevention counters
+- TrustZone attestation data
+- Secure boot state
+
+From `brom-payload/payload_common.c:93-103`
+  </Tab>
+  
+  <Tab title="Memory Read">
+```c
+case 0x5000: {  // Read arbitrary memory
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+```
+
+Allows reading any memory-mapped register or RAM region.
+
+From `brom-payload/payload_common.c:105-111`
+  </Tab>
+  
+  <Tab title="IDME Read">
+```c
+case 0x7000: {  // Read IDME field
+    char idme_buf[0x400] = { 0 };
+    char field_name[16] = { 0 };
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    
+    // Switch to IDME partition (partition 2)
+    ret = mmc_set_part(host, 2);
+    mdelay(500);
+    
+    // Search for field in IDME structure
+    uint32_t block = 0;
+    void *type_offset = 0;
+    while (!(type_offset = memmem(idme_buf, 0x400, &field_name, 16)) 
+           && block < 0x2000) {
+        if (mmc_read(host, block++, buf) != 0) {
+            send_dword(4);
+            send_dword(0xffffffff);  // Read error
+            break;
+        }
+        // Validate IDME magic on first block
+        if (block == 1 && memcmp(buf, "beefdeed", 8)) {
+            send_dword(4);
+            send_dword(0xbeefdeed);  // Invalid IDME
+            break;
+        }
+        // Sliding window search
+        memcpy(idme_buf, idme_buf + 0x200, 0x200);
+        memcpy(idme_buf + 0x200, buf, 0x200);
+    }
+    
+    if (type_offset) {
+        uint32_t len = *(uint32_t*)(type_offset + 16);
+        type_offset += 16 + 12;  // Skip to data
+        send_dword(len);
+        send_data(type_offset, len);
+    } else {
+        send_dword(4);
+        send_dword(0xdeadbeef);  // Field not found
+    }
+    break;
+}
+```
+
+IDME (ID ME) is Amazon's device configuration partition containing:
+- `device_type_id`: Device model identifier
+- Serial numbers
+- WiFi MAC addresses
+- Manufacturing data
+
+From `brom-payload/payload_common.c:112-171`
+  </Tab>
+</Tabs>
+
+### Stage2 Ready Signal
+
+```c
+void command_loop(struct msdc_host *host) {
+    printf("Entering command loop\n");
+    send_dword(0xB1B2B3B4);  // Stage2 ready magic
+    
+    while (1) {
+        uint32_t magic = recv_dword();
+        if (magic != 0xf00dd00d) {
+            printf("Protocol error\n");
+            break;
+        }
+        // Process commands...
+    }
+}
+```
+
+From `brom-payload/payload_common.c:43-58`
+
+## Preloader Payload (PL)
+
+### Overview
+
+**Source:** `brom-payload/pl.c`
+
+**Binary:** `pl.bin`
+
+**Load Address:** `0x40001000`
+
+**Purpose:** Alternative entry point when device is in preloader mode instead of BROM mode
+
+### Function Discovery via Pattern Matching
+
+Since preloader location may vary, the payload searches for functions by pattern:
+
+```c
+#define PRELOADER_BASE 0x201000
+
+uint16_t send_dword_pattern[]  = {0xB507, 0x0E03};
+uint16_t recv_dword_pattern[]  = {0x4B0E, 0x2200};
+uint16_t msdc_init_pattern[]  = {0xB538, 0x4604, 0x4D0F};
+
+uint32_t searchfunc(uint32_t startoffset, uint32_t endoffset, 
+                    uint16_t *pattern, uint32_t patternsize) {
+    uint32_t matched = 0;
+    for (uint32_t offset = startoffset; offset < endoffset; offset += 2) {
+        for (uint32_t i = 0; i < patternsize; i++) {
+            if (((uint16_t *)offset)[i] != pattern[i]) {
+                matched = 0;
+                break;
+            }
+            if (++matched == patternsize) return offset;
+        }
+    }
+    return 0;
+}
+```
+
+From `brom-payload/pl.c:14-61`
+
+### Preloader Payload Entry
+
+```c
+int main() {
+    printf("Entered preloader payload\n");
+    printf("Copyright xyz, k4y0z 2021\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+    mmc_init(&host);
+
+    // Locate preloader functions by signature
+    send_dword = (void *)(searchfunc(PRELOADER_BASE + 0x100, 
+                                     PRELOADER_BASE + 0x20000, 
+                                     send_dword_pattern, 2) | 1);
+    printf("send_dword = %p\n", send_dword);
+    
+    __recv_dword = (void *)(searchfunc(PRELOADER_BASE + 0x100, 
+                                       PRELOADER_BASE + 0x20000, 
+                                       recv_dword_pattern, 2) | 1);
+    printf("__recv_dword = %p\n", __recv_dword);
+
+    void (*msdc_init)(uint32_t card, uint32_t unk) = 
+        (void *)(searchfunc(PRELOADER_BASE + 0x100, 
+                           PRELOADER_BASE + 0x20000, 
+                           msdc_init_pattern, 3) | 1);
+    printf("msdc_init = %p\n", msdc_init);
+    msdc_init(0, 2);
+
+    command_loop(&host);  // Same as Stage2
+}
+```
+
+Note: ARM Thumb mode requires LSB set (| 1) for function pointers.
+
+From `brom-payload/pl.c:64-83`
+
+## LK Payload
+
+### Overview
+
+**Source:** `lk-payload/main.c`
+
+**Binary:** `payload.bin`
+
+**Install Location:** Boot0 partition at offset `0x80000` (512KB)
+
+**Load Address:** `0x41000000` (loaded by microloader)
+
+**Execution Context:** Called before LK boots, has full LK context access
+
+### LK Payload Purpose
+
+The LK payload hooks the bootloader to:
+1. Parse GPT for partition locations
+2. Manipulate boot mode flags
+3. Hook the read() function to hide microloader
+4. Patch security checks
+5. Enable fastboot/recovery access
+
+<Tabs>
+  <Tab title="Entry Point">
+```c
+int main() {
+    printf("This is LK-payload for mantis by xyz and k4y0z. Copyright 2019\n");
+
+    uint32_t **argptr = (void*)0x41E00020;
+    uint32_t *arg = *argptr;
+    uint32_t* o_boot_mode = (uint32_t*) *argptr + 1;
+
+    int fastboot = 0;
+
+    boot_reason = (uint32_t *)(*(uint32_t *)(0x41E5D904) + 272);
+    y_cable = (uint8_t *)(*(uint32_t *)(0x41E5D904) + 365);
+
+    printf("boot_reason: %u\n", *boot_reason);
+    printf("y_cable: %u\n", *y_cable);
+
+    parse_gpt();  // Find boot/recovery/lk/misc partitions
+    // ...
+}
+```
+
+From `lk-payload/main.c:81-97`
+  </Tab>
+  
+  <Tab title="GPT Parsing">
+```c
+static void parse_gpt() {
+    uint8_t raw[0x800] = { 0 };
+    struct device_t *dev = get_device();
+    dev->read(dev, 0x400, raw, sizeof(raw), USER_PART);
+    
+    for (size_t i = 0; i < sizeof(raw) / 0x80; ++i) {
+        uint8_t *ptr = &raw[i * 0x80];
+        uint8_t *name = ptr + 0x38;
+        uint32_t start;
+        memcpy(&start, ptr + 0x20, 4);
+        
+        if (memcmp(name, "b\x00o\x00o\x00t\x00\x00\x00", 10) == 0) {
+            printf("found boot at 0x%08X\n", start);
+            g_boot = start;
+        } else if (memcmp(name, "r\x00\x65\x00\x63\x00o\x00v\x00\x65\x00r\x00y\x00\x00\x00", 18) == 0) {
+            printf("found recovery at 0x%08X\n", start);
+            g_recovery = start;
+        } else if (memcmp(name, "l\x00k\x00\x00\x00", 6) == 0) {
+            printf("found lk at 0x%08X\n", start);
+            g_lk = start;
+        } else if (memcmp(name, "M\x00I\x00S\x00\x43\x00\x00\x00", 10) == 0) {
+            printf("found misc at 0x%08X\n", start);
+            g_misc = start;
+        }
+    }
+}
+```
+
+GPT partition names are UTF-16LE encoded.
+
+From `lk-payload/main.c:56-79`
+  </Tab>
+  
+  <Tab title="Read Hook">
+```c
+size_t read_func(struct device_t *dev, uint64_t block_off, 
+                void *dst, uint32_t sz, uint32_t part) {
+    printf("read_func hook\n");
+    int ret = 0;
+    
+    // Hook reads to boot or recovery partition
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        printf("demangle boot image - from 0x%08X\n", 
+               __builtin_return_address(0));
+
+        // Redirect to recovery if y-cable connected
+        if (block_off == g_boot * 0x200 && *y_cable == 1 
+            && !boot_system && *boot_reason == 0) {
+            printf("Boot into recovery to display bootmenu");
+            block_off = g_recovery * 0x200;
+        }
+        
+        // Skip microloader (first 0x400 bytes)
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            void *second_copy = (char*)dst + 0x400;
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);  // Copy real header
+            memset(second_copy, 0, 0x400);     // Clear microloader
+        }
+    } else {
+        ret = original_read(dev, block_off, dst, sz, part);
+    }
+    return ret;
+}
+```
+
+This hook transparently removes the microloader from boot images so LK sees valid Android boot headers.
+
+From `lk-payload/main.c:32-54`
+  </Tab>
+  
+  <Tab title="Security Patches">
+```c
+// Device is unlocked
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1
+*patch = 0x4770;   // bx lr
+// Function now returns 1 (unlocked)
+
+// amzn_verify_unlock (enable all commands)
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0
+*patch = 0x4770;   // bx lr
+// Function now returns 0 (success)
+
+// Hook bootimg read function
+uint32_t *patch32;
+original_read = (void*)dev->read;
+patch32 = (void*)&dev->read;
+*patch32 = (uint32_t)read_func;
+```
+
+These patches:
+- Force bootloader unlock state
+- Enable all fastboot commands
+- Install read hook
+
+From `lk-payload/main.c:212-225`
+  </Tab>
+  
+  <Tab title="Boot Mode Control">
+```c
+// Check microloader flag
+uint8_t *tmp = (void*)0x41e0062c;
+if (strncmp(tmp, "FASTBOOT_PLEASE", 15) == 0 ) {
+    fastboot = 1;
+}
+
+// Read MISC partition boot flags
+dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+printf("bootloader_msg: %s\n", bootloader_msg);
+
+if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+    fastboot = 1;
+    // Reset flag
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+else if(strncmp(bootloader_msg, "boot-recovery", 13) == 0) {
+    *g_boot_mode = 2;  // Recovery mode
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+else if(strncmp(bootloader_msg, "boot-system", 11) == 0) {
+    boot_system = 1;  // Force normal boot
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+
+if (fastboot) {
+    *g_boot_mode = 99;  // Fastboot mode
+    video_printf("=> HACKED FASTBOOT mode: (%d) - xyz, k4y0z\n", 
+                 *o_boot_mode);
+}
+```
+
+From `lk-payload/main.c:111-203`
+  </Tab>
+  
+  <Tab title="Memory Restore">
+```c
+// Restore the 0x41E00200-0x41E01200 range
+// A part was overwritten by microloader
+dev->read(dev, g_lk * 0x200 + 0x200 + 0x200, 
+          (char*)LK_BASE + 0x200, 0x1000, USER_PART);
+
+// Check if backup payload is present
+dev->read(dev, BACKUP_SRC, (void*)0x45000000, PAYLOAD_SIZE, BOOT0_PART);
+if (memcmp((void*)PAYLOAD_DST, (void*)0x45000000, PAYLOAD_SIZE)) {
+    printf("Backup payload not found...\n");
+    printf("...copy payload to backup location\n");
+    dev->write(dev, (void*)PAYLOAD_DST, BACKUP_SRC, PAYLOAD_SIZE, BOOT0_PART);
+}
+
+printf("Clean lk\n");
+cache_clean((void*)LK_BASE, LK_SIZE);
+
+printf("Jump lk\n");
+int (*app)() = (void*)0x41E25371;  // LK entry point
+app();
+```
+
+From `lk-payload/main.c:121-232`
+  </Tab>
+</Tabs>
+
+### LK Payload Function Pointers
+
+```c
+struct device_t* (*get_device)() = (void*)0x41E22ED1;
+void (*cache_clean)(void *addr, size_t sz) = (void*)0x41E231E4;
+size_t (*video_printf)(const char *format, ...) = (void *)0x41E2790B;
+
+uint32_t* g_boot_mode = (uint32_t*) 0x41E5544C;
+```
+
+From `lk-payload/common.h:12-16`
+
+## Microloader
+
+### Overview
+
+**Source:** `microloader/main.c`
+
+**Binary:** `microloader.bin`
+
+**Install Location:** Boot partition, first 0x400 bytes (1024 bytes)
+
+**Purpose:** Minimal stage that loads LK payload before LK boots
+
+### Implementation
+
+```c
+int main() {
+    puts("microloader");
+
+    struct device_t *dev = (void*)get_device();
+
+    uint32_t *dst = (void*)PAYLOAD_DST;  // 0x41000000
+    
+    // Try to read payload from primary location
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    // PAYLOAD_SRC = 0x80000, PAYLOAD_SIZE = 0x80000 (512KB)
+
+    // Check if payload is valid (magic: 0xe3a0d442)
+    if(*dst != 0xe3a0d442) {
+        puts("Try backup");
+        // Try backup location
+        size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+        // BACKUP_SRC = 0x200000
+    }
+
+    cache_clean(dst, PAYLOAD_SIZE);
+
+    // Jump to the payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();  // Transfer control to LK payload at 0x41000000
+
+    while (1) { }  // Should never reach here
+}
+```
+
+From `microloader/main.c:31-58`
+
+### Microloader Magic
+
+The microloader checks for ARM instruction `0xe3a0d442`:
+
+```assembly
+mov sp, #0x42000000  ; Set stack pointer
+```
+
+This is the first instruction of the LK payload, serving as a validity check.
+
+### Installation Process
+
+The microloader replaces the Android boot image header:
+
+```python
+# Read original boot header (0x400 bytes across 2 blocks)
+boot_hdr1 = dev.emmc_read(gpt["boot"][0]) + dev.emmc_read(gpt["boot"][0] + 1)
+boot_hdr2 = dev.emmc_read(gpt["boot"][0] + 2) + dev.emmc_read(gpt["boot"][0] + 3)
+
+# Write microloader to first 0x400 bytes
+flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+
+# If second header wasn't the kernel (ANDROID! magic), restore original header
+if boot_hdr2[0:8] != b"ANDROID!":
+    flash_data(dev, boot_hdr1, gpt["boot"][0] + 2, 2 * 0x200)
+```
+
+From `modules/main.py:95-100`
+
+## Payload Size Constraints
+
+| Payload | Max Size | Reason |
+|---------|----------|--------|
+| Stage1 | 0xA00 (2560 bytes) | BROM SRAM limit |
+| Stage2 | ~32KB | SRAM available at 0x201000 |
+| PL | ~32KB | Same as Stage2 |
+| LK Payload | 512KB | Boot0 allocation |
+| Microloader | 1024 bytes | Must fit in boot header |
+
+## Payload Communication Flow
+
+```
+Python → [USB Serial] → Stage1 → [Memory Write] → Stage2
+                          ↓                          ↓
+                     [Confirmation]            [eMMC Access]
+                      0xA1A2A3A4                0xB1B2B3B4
+                                                     ↓
+                                              [Install Payloads]
+                                                     ↓
+                                              [Reboot Device]
+                                                     ↓
+                        Microloader → LK Payload → Hooked LK → Kernel
+```
+
+## Debugging Output
+
+All payloads output debug information via UART:
+
+```c
+void low_uart_put(int ch) {
+    volatile uint32_t *uart_reg0 = (volatile uint32_t*)0x11003014;
+    volatile uint32_t *uart_reg1 = (volatile uint32_t*)0x11003000;
+
+    while ( !((*uart_reg0) & 0x20) )  // Wait for TX ready
+    {}
+
+    *uart_reg1 = ch;  // Send character
+}
+```
+
+**UART Configuration:**
+- Base Address: `0x11003000`
+- Baud Rate: 115200 (typically)
+- Line Status Register: `+0x14` (bit 5 = TX empty)
+- TX Holding Register: `+0x00`
+
+Connect a USB-to-serial adapter to view payload execution in real-time.

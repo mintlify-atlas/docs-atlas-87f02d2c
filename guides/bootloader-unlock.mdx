@@ -1,0 +1,406 @@
+---
+title: Bootloader Unlock
+description: Verify and use the unlocked bootloader after running the Kamakiri exploit
+---
+
+## Overview
+
+After successfully running the Kamakiri exploit, your device's bootloader is effectively unlocked through the custom `lk-payload`. This payload bypasses Amazon's bootloader lock checks and enables all fastboot commands.
+
+## How the Unlock Works
+
+The lk-payload patches the bootloader in memory on every boot:
+
+```c
+// From lk-payload/main.c:211-219
+
+// device is unlocked
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1
+*patch = 0x4770;   // bx lr
+
+// amzn_verify_unlock (enable all commands)
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0
+*patch = 0x4770;   // bx lr
+```
+
+These patches:
+1. Force the device to report as unlocked (`movs r0, #1`)
+2. Bypass Amazon's unlock verification (`movs r0, #0` = no error)
+
+<Note>
+The bootloader isn't permanently modified. The lk-payload in boot0 applies these patches on every boot, making the unlock persistent but reversible.
+</Note>
+
+## Booting into Fastboot Mode
+
+There are multiple ways to boot into the hacked fastboot mode:
+
+### Method 1: MISC Partition Flag (Auto-set by Exploit)
+
+After running the exploit, the device automatically boots to fastboot because of the `FASTBOOT_PLEASE` flag:
+
+```python
+# From modules/functions.py:81-86
+def force_fastboot(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "FASTBOOT_PLEASE\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+```
+
+This is a **persistent** flag - the device will boot to fastboot on every boot until cleared.
+
+### Method 2: Factory Mode (Hardware)
+
+Use the factory mode button combination for your device while powering on. This sends boot mode 4:
+
+```c
+// From lk-payload/main.c:132-134
+// factory and factory advanced boot
+if(*o_boot_mode == 4 ) {
+  fastboot = 1;
+}
+```
+
+### Method 3: Boot Scripts
+
+Use the provided boot scripts to set temporary flags:
+
+#### Boot to Fastboot
+
+```bash
+./boot-fastboot.sh
+```
+
+This script:
+1. Enters bootrom mode
+2. Loads the exploit payload
+3. Sends the `FACTFACT` command to trigger fastboot mode
+
+```bash
+# From boot-fastboot.sh
+cd modules
+python3 handshake2.py FACTFACT
+cd ..
+```
+
+#### Boot to Recovery
+
+```bash
+./boot-recovery.sh
+```
+
+Sends `FACTORYM` command:
+
+```bash
+# From boot-recovery.sh
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+```c
+// From lk-payload/main.c:136-139
+// use advanced factory mode to boot recovery
+else if(*o_boot_mode == 6) {
+  *g_boot_mode = 2;
+}
+```
+
+## Fastboot Mode Indicators
+
+When successfully in hacked fastboot mode, you'll see on the device screen:
+
+```
+=> HACKED FASTBOOT mode: (0) - xyz, k4y0z
+```
+
+The number in parentheses indicates the original boot mode.
+
+## Verify Bootloader Status
+
+Connect to the device via USB and check the bootloader status:
+
+```bash
+fastboot devices
+```
+
+You should see your device listed:
+
+```
+0123456789ABCDEF    fastboot
+```
+
+Check unlock status:
+
+```bash
+fastboot getvar unlocked
+```
+
+Expected output:
+
+```
+unlocked: yes
+Finished. Total time: 0.001s
+```
+
+Check all variables:
+
+```bash
+fastboot getvar all
+```
+
+## Available Fastboot Commands
+
+With the hacked bootloader, all fastboot commands are enabled:
+
+### Device Information
+
+```bash
+# Get device info
+fastboot getvar product
+fastboot getvar version-bootloader
+fastboot getvar serialno
+
+# Partition info
+fastboot getvar partition-size:boot
+fastboot getvar partition-size:recovery
+fastboot getvar partition-size:system
+```
+
+### Flashing Operations
+
+```bash
+# Flash partitions (examples)
+fastboot flash boot boot.img
+fastboot flash recovery recovery.img
+fastboot flash system system.img
+
+# Flash bootloader components
+fastboot flash lk lk.bin
+fastboot flash tee tee.img
+```
+
+<Warning>
+Flashing the `lk` or `tee` partitions will overwrite the downgraded versions installed by the exploit. Only do this if you have a way to re-run the exploit.
+</Warning>
+
+### Boot Images Temporarily
+
+```bash
+# Boot a recovery image without flashing
+fastboot boot recovery.img
+
+# Boot a custom kernel
+fastboot boot boot.img
+```
+
+### Erase Partitions
+
+```bash
+# Erase a partition
+fastboot erase cache
+fastboot erase userdata
+```
+
+### Reboot Commands
+
+```bash
+# Reboot to system
+fastboot reboot
+
+# Reboot to bootloader
+fastboot reboot-bootloader
+
+# Reboot to recovery
+fastboot reboot recovery
+```
+
+## Boot Mode Selection
+
+The lk-payload supports several boot modes controlled by flags in the MISC partition:
+
+### Persistent Fastboot
+
+Set from Python:
+
+```python
+from modules.functions import force_fastboot
+force_fastboot(dev, gpt)
+```
+
+This writes `FASTBOOT_PLEASE` to MISC. The flag persists until cleared by booting to recovery:
+
+```c
+// From lk-payload/main.c:156-165
+else if(strncmp(bootloader_msg, "FASTBOOT_PLEASE", 15) == 0) {
+  // only reset flag in recovery-boot
+  if(*g_boot_mode == 2) {
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+  }
+  else {
+    fastboot = 1;
+  }
+}
+```
+
+### Temporary Fastboot
+
+Set from Python:
+
+```python
+from modules.functions import temp_fastboot
+temp_fastboot(dev, gpt)
+```
+
+This writes `boot-amonet` to MISC. The flag is automatically cleared after one boot:
+
+```c
+// From lk-payload/main.c:148-153
+if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+  fastboot = 1;
+  // reset flag
+  memset(bootloader_msg, 0, 0x10);
+  dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+```
+
+### Force Recovery
+
+Set from Python:
+
+```python
+from modules.functions import force_recovery
+force_recovery(dev, gpt)
+```
+
+This writes `boot-recovery` to MISC and clears after one boot.
+
+### Force Normal Boot
+
+Clear all boot mode flags:
+
+```python
+from modules.functions import clear_flags
+clear_flags(dev, gpt)
+```
+
+Or set `boot-system` for a one-time normal boot that skips recovery-on-boot logic.
+
+## Clearing Fastboot Mode
+
+If your device is stuck booting to fastboot mode:
+
+### From Fastboot
+
+Boot to recovery, which will clear the flag:
+
+```bash
+fastboot reboot recovery
+```
+
+### From Recovery
+
+The lk-payload automatically clears the `FASTBOOT_PLEASE` flag when booting to recovery mode.
+
+### Manually via Exploit
+
+Re-enter bootrom mode and clear the flag:
+
+```python
+cd modules
+python3 << 'EOF'
+from common import Device
+from load_payload import load_payload
+from functions import clear_flags, parse_gpt, switch_user
+
+dev = Device()
+dev.find_device()
+load_payload(dev)
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+clear_flags(dev, gpt)
+dev.reboot()
+EOF
+cd ..
+```
+
+## Additional Features
+
+### Boot Image Demangling
+
+The lk-payload hooks the boot image read function to support the microloader:
+
+```c
+// From lk-payload/main.c:32-54
+size_t read_func(struct device_t *dev, uint64_t block_off, void *dst, uint32_t sz, uint32_t part) {
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        // Demangle boot image by skipping first 0x400 bytes (microloader)
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);
+        }
+    }
+}
+```
+
+This allows the microloader to coexist with normal boot images.
+
+### UART Logging
+
+Enable UART logging by setting a flag in MISC+0x10:
+
+```python
+block[0x10:0x21] = "UART_PLEASE".encode("utf-8")
+```
+
+This modifies kernel cmdline to enable UART output.
+
+## Troubleshooting
+
+### Device Not Showing in Fastboot
+
+1. Ensure device is actually in fastboot mode (check screen)
+2. Install fastboot drivers (Windows) or configure udev rules (Linux)
+3. Try a different USB cable or port
+
+### Fastboot Commands Fail
+
+If commands return errors:
+
+```bash
+fastboot flash boot boot.img
+FAILED (remote: 'not allowed')
+```
+
+The lk-payload may not be loaded. Possible causes:
+- Boot0 was overwritten
+- MISC flag is not set properly
+- Device booted from preloader instead of lk-payload
+
+Solution: Re-run the Kamakiri exploit.
+
+### Device Boots to Normal System Instead of Fastboot
+
+The MISC flag may have been cleared. Set it again:
+
+```bash
+./bootrom-step.sh  # Re-run exploit (sets FASTBOOT_PLEASE flag)
+```
+
+Or use the boot-fastboot script for temporary access.
+
+## Next Steps
+
+With an unlocked bootloader, you can:
+
+1. [Install custom recovery](/guides/custom-recovery) - Flash TWRP for full system access
+2. Flash custom ROMs
+3. Install custom kernels
+4. Modify system partitions

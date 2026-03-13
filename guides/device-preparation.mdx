@@ -1,0 +1,234 @@
+---
+title: Device Preparation
+description: Preparing your MediaTek device for the Kamakiri bootrom exploit
+---
+
+## Overview
+
+Before running the Kamakiri exploit, you need to properly prepare your MediaTek device and enter bootrom mode. This guide covers the necessary hardware setup and initial device connection.
+
+<Warning>
+This exploit is specifically designed for the Amazon Fire tablet with device type ID `AKPGW064GI9HE` (mantis). Using it on other devices may cause permanent damage.
+</Warning>
+
+## Prerequisites
+
+### Hardware Requirements
+
+- MediaTek-based Amazon Fire tablet (mantis)
+- USB data cable (capable of data transfer, not just charging)
+- Linux computer with USB ports
+- Short wire or conductive material (for entering bootrom mode)
+
+### Software Requirements
+
+Install required Python packages:
+
+```bash
+pip install pyserial pyusb
+```
+
+<Note>
+The exploit requires Python 3 and communicates over USB serial at 115200 baud.
+</Note>
+
+## Disable ModemManager
+
+ModemManager interferes with the serial communication needed for the exploit. Check if it's running:
+
+```bash
+ps aux | grep -i modemmanager
+```
+
+If ModemManager is running, you must disable it:
+
+```bash
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+
+<Warning>
+The exploit will automatically detect ModemManager and refuse to run if it's active. You must disable it before proceeding.
+</Warning>
+
+## Entering Bootrom Mode
+
+The device must be in bootrom mode for the exploit to work. There are two methods:
+
+### Method 1: From Preloader Mode
+
+If your device boots into preloader mode (detected automatically), the exploit can crash the preloader to enter bootrom:
+
+<Steps>
+  <Step title="Power off the device">
+    Ensure the device is completely powered off.
+  </Step>
+  
+  <Step title="Connect via USB">
+    Connect the device to your computer using a USB data cable.
+  </Step>
+  
+  <Step title="Run the crash command">
+    Execute the bootrom script with the crash option:
+    
+    ```bash
+    ./bootrom-step.sh crash
+    ```
+    
+    The script will detect preloader mode and crash it to enter bootrom mode.
+  </Step>
+</Steps>
+
+### Method 2: Hardware Short Method
+
+<Steps>
+  <Step title="Power off completely">
+    Make sure the device is fully powered off and disconnected from USB.
+  </Step>
+  
+  <Step title="Locate test points">
+    Open the device and locate the appropriate test points for your model. These are typically exposed pads on the circuit board that, when shorted, force the SoC into bootrom mode.
+  </Step>
+  
+  <Step title="Apply the short">
+    Using a wire or conductive material, short the test points together.
+  </Step>
+  
+  <Step title="Connect USB while shorted">
+    While maintaining the short, connect the USB cable to your computer.
+  </Step>
+  
+  <Step title="Remove the short">
+    After the device is detected (LED may light up), **remove the short immediately**. The exploit will prompt you:
+    
+    ```
+    * * * If you have a short attached, remove it now * * *
+    * * * Press Enter to continue * * *
+    ```
+    
+    Remove the short wire and press Enter.
+  </Step>
+</Steps>
+
+<Warning>
+Keeping the short attached longer than necessary may damage the device. Remove it as soon as the device is detected.
+</Warning>
+
+## Device Detection
+
+The exploit automatically detects when a MediaTek device connects:
+
+```python
+# From modules/common.py
+VID = "0E8D"  # MediaTek Vendor ID
+PID = "0003"  # Bootrom Product ID
+```
+
+When you run the exploit, it will wait for a device:
+
+```
+Waiting for device
+Found port = /dev/ttyACM0
+```
+
+### Bootrom vs Preloader Detection
+
+The exploit can detect whether your device is in bootrom or preloader mode:
+
+- **Bootrom mode**: Product ID is `0003`
+- **Preloader mode**: Different product ID (automatically uses alternative payload)
+
+## USB Connection Verification
+
+Verify the device is connected properly:
+
+```bash
+lsusb | grep -i mediatek
+```
+
+You should see output similar to:
+
+```
+Bus 001 Device 005: ID 0e8d:0003 MediaTek Inc. MT65xx Preloader
+```
+
+Check serial port permissions:
+
+```bash
+ls -l /dev/ttyACM*
+```
+
+If you don't have permission, add your user to the dialout group:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+Then log out and back in for the change to take effect.
+
+## Handshake Process
+
+Once connected, the exploit performs a handshake sequence:
+
+```python
+# From modules/common.py:113-127
+def handshake(self):
+    # look for start byte
+    while True:
+        c = self._writeb(b'\xa0')
+        if c == b'\x5f':
+            self.dev.flushInput()
+            self.dev.flushOutput()
+            break
+        self.dev.flushInput()
+        self.dev.flushOutput()
+
+    # complete sequence
+    self.check(self._writeb(b'\x0a'), b'\xf5')
+    self.check(self._writeb(b'\x50'), b'\xaf')
+    self.check(self._writeb(b'\x05'), b'\xfa')
+```
+
+If the handshake succeeds, you'll see:
+
+```
+Handshake
+Disable watchdog
+```
+
+## Troubleshooting
+
+### Device Not Detected
+
+- Verify USB cable supports data transfer
+- Try a different USB port
+- Check that ModemManager is disabled
+- Ensure device is in bootrom mode (try the crash method)
+
+### Permission Denied
+
+```bash
+# Add user to dialout group
+sudo usermod -a -G dialout $USER
+# Then log out and back in
+```
+
+### Handshake Failure
+
+- Device may not be in proper bootrom mode
+- Try unplugging and re-entering bootrom mode
+- Verify no other programs are accessing the serial port
+
+### Wrong Device Detected
+
+If you see:
+
+```
+Wrong device detected: [device_type_id]
+```
+
+This exploit only works with `AKPGW064GI9HE` (mantis). Using it on other devices may cause damage.
+
+## Next Steps
+
+Once your device is properly prepared and connected, proceed to [Running the Exploit](/guides/running-exploit).

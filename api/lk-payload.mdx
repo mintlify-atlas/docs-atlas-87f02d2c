@@ -1,0 +1,448 @@
+---
+title: 'LK Payload'
+description: 'Little Kernel bootloader payload for boot mode control and unlock bypass'
+---
+
+## Overview
+
+The LK (Little Kernel) payload hooks into the Android bootloader to control boot behavior, unlock bootloader restrictions, and enable fastboot access. It runs early in the boot chain and can modify boot image loading behavior.
+
+**Source:** `lk-payload/main.c:81`
+
+## Memory Layout
+
+### Key Addresses
+
+```c
+#define LK_BASE 0x41E00000
+#define LK_SIZE (1024 * 1024)  // 1MB
+
+#define PAYLOAD_DST 0x41000000  // Where payload is loaded
+#define PAYLOAD_SRC 0x80000      // eMMC offset (512KB)
+#define PAYLOAD_SIZE 0x80000     // 512KB
+#define BACKUP_SRC 0x200000      // Backup location (2MB)
+```
+
+**Implementation:** `lk-payload/common.h:18-25`
+
+### Important Pointers
+
+```c
+// Boot configuration
+uint32_t **argptr = (void*)0x41E00020;
+uint32_t *arg = *argptr;
+uint32_t *o_boot_mode = (uint32_t*) *argptr + 1;
+uint32_t *g_boot_mode = (uint32_t*) 0x41E5544C;
+
+// Device state
+uint32_t *boot_reason = (uint32_t *)(*(uint32_t *)(0x41E5D904) + 272);
+uint8_t *y_cable = (uint8_t *)(*(uint32_t *)(0x41E5D904) + 365);
+```
+
+**Implementation:** `lk-payload/main.c:85-92`
+
+## Boot Modes
+
+The payload controls device boot mode through these values:
+
+| Mode | Description |
+|------|-------------|
+| 0 | Normal boot |
+| 2 | Recovery mode |
+| 4 | Factory mode |
+| 6 | Advanced factory mode |
+| 99 | Fastboot mode (hacked) |
+
+**Implementation:** `lk-payload/main.c:132-200`
+
+## GPT Partition Detection
+
+The payload parses the GPT to locate key partitions:
+
+```c
+static void parse_gpt() {
+    uint8_t raw[0x800] = { 0 };
+    struct device_t *dev = get_device();
+    dev->read(dev, 0x400, raw, sizeof(raw), USER_PART);
+    
+    for (size_t i = 0; i < sizeof(raw) / 0x80; ++i) {
+        uint8_t *ptr = &raw[i * 0x80];
+        uint8_t *name = ptr + 0x38;
+        uint32_t start;
+        memcpy(&start, ptr + 0x20, 4);
+        
+        if (memcmp(name, "b\x00o\x00o\x00t\x00\x00\x00", 10) == 0) {
+            g_boot = start;
+        } else if (memcmp(name, "r\x00\x65\x00\x63\x00o\x00v\x00\x65\x00r\x00y\x00\x00\x00", 18) == 0) {
+            g_recovery = start;
+        } else if (memcmp(name, "l\x00k\x00\x00\x00", 6) == 0) {
+            g_lk = start;
+        } else if (memcmp(name, "M\x00I\x00S\x00\x43\x00\x00\x00", 10) == 0) {
+            g_misc = start;
+        }
+    }
+}
+```
+
+**Implementation:** `lk-payload/main.c:56-79`
+
+<Note>
+The GPT parser reads partition table entries from offset 0x400 (block 1) in the user partition. Each entry is 128 bytes (0x80) and contains the partition name in UTF-16LE format.
+</Note>
+
+## Boot Mode Control Flags
+
+### MISC Partition Flags
+
+The payload reads control flags from the MISC partition:
+
+| Flag | Offset | Action |
+|------|--------|--------|
+| `boot-amonet` | 0x00 | Boot to fastboot (temporary) |
+| `FASTBOOT_PLEASE` | 0x00 | Boot to fastboot (persistent) |
+| `boot-recovery` | 0x00 | Boot to recovery mode |
+| `boot-system` | 0x00 | Force normal system boot |
+| `UART_PLEASE` | 0x10 | Enable UART output |
+
+**Implementation:** `lk-payload/main.c:141-190`
+
+### Flag Processing Example
+
+```c
+// Read MISC partition
+dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+
+// Temporary fastboot flag
+if (strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+    fastboot = 1;
+    // Reset flag
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+
+// Persistent fastboot flag
+else if (strncmp(bootloader_msg, "FASTBOOT_PLEASE", 15) == 0) {
+    // Only reset flag in recovery boot
+    if (*g_boot_mode == 2) {
+        memset(bootloader_msg, 0, 0x10);
+        dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+    } else {
+        fastboot = 1;
+    }
+}
+```
+
+**Implementation:** `lk-payload/main.c:148-165`
+
+<Note>
+The `boot-amonet` flag is automatically cleared after use, while `FASTBOOT_PLEASE` persists until cleared by booting into recovery mode.
+</Note>
+
+### Microloader Integration
+
+The payload also checks for flags set by the microloader:
+
+```c
+// Check microloader message
+uint8_t *tmp = (void*)0x41e0062c;
+if (strncmp(tmp, "FASTBOOT_PLEASE", 15) == 0) {
+    fastboot = 1;
+}
+```
+
+**Implementation:** `lk-payload/main.c:109-114`
+
+## Boot Image Hooking
+
+The payload hooks the `read` function to modify boot images as they're loaded:
+
+```c
+size_t read_func(struct device_t *dev, uint64_t block_off, 
+                 void *dst, uint32_t sz, uint32_t part) {
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        printf("demangle boot image\n");
+        
+        // Check if Y-cable is connected and should redirect to recovery
+        if (block_off == g_boot * 0x200 && *y_cable == 1 && 
+            !boot_system && *boot_reason == 0) {
+            printf("Boot into recovery to display bootmenu\n");
+            block_off = g_recovery * 0x200;
+        }
+        
+        // Skip first 1KB of boot image (exploit payload area)
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            void *second_copy = (char*)dst + 0x400;
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);
+            memset(second_copy, 0, 0x400);
+        }
+    } else {
+        ret = original_read(dev, block_off, dst, sz, part);
+    }
+    return ret;
+}
+```
+
+**Implementation:** `lk-payload/main.c:32-54`
+
+<Note>
+The boot image hook removes the first 1KB from boot/recovery images. This area is used to store the exploit payload and must be removed before the bootloader processes the Android boot image header.
+</Note>
+
+### Installing the Hook
+
+```c
+// Save original read function
+original_read = (void*)dev->read;
+
+// Replace with hook
+uint32_t *patch32 = (void*)&dev->read;
+*patch32 = (uint32_t)read_func;
+```
+
+**Implementation:** `lk-payload/main.c:221-225`
+
+## Security Bypass
+
+### Unlock Status Bypass
+
+Forces the bootloader to report as unlocked:
+
+```c
+// device_is_unlocked()
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1
+*patch = 0x4770;   // bx lr
+```
+
+**Implementation:** `lk-payload/main.c:211-214`
+
+### Command Verification Bypass
+
+Disables Amazon's fastboot command verification:
+
+```c
+// amzn_verify_unlock() - enable all commands
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0
+*patch = 0x4770;   // bx lr
+```
+
+**Implementation:** `lk-payload/main.c:216-219`
+
+<Note>
+These patches modify ARM Thumb-2 instructions to force functions to return specific values. `movs r0, #1` sets the return value to 1 (true), while `bx lr` returns immediately.
+</Note>
+
+## Payload Backup
+
+The payload automatically maintains a backup copy:
+
+```c
+// Check if backup payload is present
+dev->read(dev, BACKUP_SRC, (void*)0x45000000, PAYLOAD_SIZE, BOOT0_PART);
+if (memcmp((void*)PAYLOAD_DST, (void*)0x45000000, PAYLOAD_SIZE)) {
+    printf("Backup payload not found...\n");
+    printf("...copy payload to backup location\n");
+    dev->write(dev, (void*)PAYLOAD_DST, BACKUP_SRC, PAYLOAD_SIZE, BOOT0_PART);
+}
+```
+
+**Implementation:** `lk-payload/main.c:124-129`
+
+## UART Control
+
+Enables kernel UART output if requested:
+
+```c
+// UART flag on MISC at offset 0x10
+if (strncmp(bootloader_msg + 0x10, "UART_PLEASE", 11) == 0) {
+    // Force uart enable
+    char* disable_uart = (char*)0x41E3A3AB;
+    strcpy(disable_uart, " printk.disable_uart=0");
+}
+```
+
+**Implementation:** `lk-payload/main.c:184-188`
+
+<Note>
+This modifies the kernel command line in memory to enable UART logging, useful for debugging boot issues.
+</Note>
+
+## Device Structure
+
+```c
+struct device_t {
+    uint32_t unk1;
+    uint32_t unk2;
+    uint32_t unk3;
+    uint32_t unk4;
+    size_t (*read)(struct device_t *dev, uint64_t dev_addr, 
+                   void *dst, uint32_t size, uint32_t part);
+    size_t (*write)(struct device_t *dev, void *src, 
+                    uint64_t block_off, uint32_t size, uint32_t part);
+};
+
+struct device_t* (*get_device)() = (void*)0x41E22ED1;
+```
+
+**Implementation:** `lk-payload/common.h:3-12`
+
+## Utility Functions
+
+### Cache Management
+
+```c
+void (*cache_clean)(void *addr, size_t sz) = (void*)0x41E231E4;
+
+// Clean LK memory before jumping
+cache_clean((void*)LK_BASE, LK_SIZE);
+```
+
+**Implementation:** `lk-payload/common.h:13` and `lk-payload/main.c:228`
+
+### Video Output
+
+```c
+size_t (*video_printf)(const char *format, ...) = (void *)0x41E2790B;
+
+video_printf("=> HACKED FASTBOOT mode: (%d) - xyz, k4y0z\n", *o_boot_mode);
+```
+
+**Implementation:** `lk-payload/common.h:14` and `lk-payload/main.c:202`
+
+### UART Output
+
+```c
+void low_uart_put(int ch) {
+    volatile uint32_t *uart_reg0 = (volatile uint32_t*)0x11003014;
+    volatile uint32_t *uart_reg1 = (volatile uint32_t*)0x11003000;
+    
+    while (!((*uart_reg0) & 0x20))
+        {}
+    
+    *uart_reg1 = ch;
+}
+```
+
+**Implementation:** `lk-payload/main.c:7-15`
+
+## Boot Flow
+
+### Standard Boot Sequence
+
+1. Microloader loads LK payload from eMMC
+2. LK payload restores overwritten memory
+3. Parse GPT to locate partitions
+4. Check boot mode flags (MISC, microloader)
+5. Apply security patches
+6. Install boot image hook
+7. Jump to original LK entry point
+8. LK loads boot/recovery image (via hook)
+9. Boot continues normally
+
+**Implementation:** `lk-payload/main.c:81-237`
+
+### Fastboot Boot Sequence
+
+1. Steps 1-5 same as above
+2. Set `*g_boot_mode = 99` (fastboot)
+3. Apply patches and install hooks
+4. Jump to LK
+5. LK enters fastboot mode with unlocked commands
+
+### Recovery Boot Menu
+
+When Y-cable is detected:
+
+```c
+if (block_off == g_boot * 0x200 && *y_cable == 1 && 
+    !boot_system && *boot_reason == 0) {
+    printf("Boot into recovery to display bootmenu\n");
+    block_off = g_recovery * 0x200;  // Redirect to recovery
+}
+```
+
+**Implementation:** `lk-payload/main.c:38-41`
+
+## Usage Example
+
+### Setting Boot Flags
+
+```python
+import struct
+
+class LKControl:
+    def __init__(self, stage2):
+        self.s2 = stage2
+        # Find MISC partition by reading GPT
+        self.misc_block = self.find_partition('MISC')
+    
+    def set_fastboot_flag(self, persistent=False):
+        """Set flag to boot to fastboot mode"""
+        flag = b'FASTBOOT_PLEASE' if persistent else b'boot-amonet'
+        msg = flag.ljust(32, b'\x00')
+        
+        self.s2.switch_partition(8)  # USER_PART
+        self.s2.write_block(self.misc_block, msg[:512])
+    
+    def set_recovery_flag(self):
+        """Set flag to boot to recovery"""
+        msg = b'boot-recovery'.ljust(512, b'\x00')
+        self.s2.switch_partition(8)
+        self.s2.write_block(self.misc_block, msg)
+    
+    def enable_uart(self):
+        """Enable kernel UART output"""
+        # Read existing message
+        msg = bytearray(self.s2.read_block(self.misc_block))
+        # Set UART flag at offset 0x10
+        msg[0x10:0x10+11] = b'UART_PLEASE'
+        self.s2.write_block(self.misc_block, bytes(msg))
+    
+    def clear_flags(self):
+        """Clear all boot flags"""
+        msg = b'\x00' * 512
+        self.s2.switch_partition(8)
+        self.s2.write_block(self.misc_block, msg)
+
+# Usage
+lk = LKControl(stage2)
+
+# Boot to fastboot mode
+lk.set_fastboot_flag(persistent=True)
+lk.enable_uart()
+stage2.reboot()
+
+# Device will boot to fastboot with unlocked commands
+```
+
+## Partition Types
+
+```c
+#define BOOT0_PART 1
+#define USER_PART 8
+```
+
+**Implementation:** `lk-payload/common.h:22-23`
+
+- **BOOT0_PART**: Boot partition 1 (stores payload)
+- **USER_PART**: Main user data partition (stores OS, GPT)
+
+## Return to Bootloader
+
+The payload jumps back to the original LK bootloader:
+
+```c
+printf("Jump lk\n");
+int (*app)() = (void*)0x41E25371;
+app();
+```
+
+**Implementation:** `lk-payload/main.c:230-232`
+
+<Note>
+This address points to the LK app entry point. After jumping, the bootloader continues normal execution with all hooks and patches active.
+</Note>

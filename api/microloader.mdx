@@ -1,0 +1,429 @@
+---
+title: 'Microloader'
+description: 'Boot-time payload loader that executes before the Little Kernel bootloader'
+---
+
+## Overview
+
+The microloader is a minimal payload that runs at boot time, before the Little Kernel (LK) bootloader. Its sole purpose is to load the LK payload from eMMC storage into memory and execute it. It serves as the persistent exploit component that survives reboots.
+
+**Source:** `microloader/main.c:31`
+
+## Memory Layout
+
+### Key Addresses
+
+```c
+#define PAYLOAD_DST 0x41000000   // Where LK payload is loaded
+#define PAYLOAD_SRC 0x80000       // Primary eMMC offset (512KB)
+#define PAYLOAD_SIZE 0x80000      // 512KB
+#define BACKUP_SRC 0x200000       // Backup eMMC offset (2MB)
+
+#define BOOT0_PART 1              // eMMC boot partition 1
+```
+
+**Implementation:** `lk-payload/common.h:18-25` (shared with LK payload)
+
+<Note>
+The microloader is installed in the boot image at offset 0x00-0x400 (1KB). It executes before LK and loads the full LK payload from the eMMC boot partition.
+</Note>
+
+## Boot Flow
+
+1. **Device powers on**
+2. **BootROM loads boot image** (including microloader)
+3. **Microloader executes**
+   - Get device structure
+   - Read LK payload from eMMC BOOT0 partition
+   - If primary payload invalid, try backup location
+   - Clean cache
+   - Jump to LK payload
+4. **LK payload executes**
+5. **Normal boot continues**
+
+## Implementation
+
+### Main Function
+
+```c
+int main() {
+    puts("microloader");
+    
+    struct device_t *dev = (void*)get_device();
+    
+    uint32_t *dst = (void*)PAYLOAD_DST;
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    
+    // Check if payload is valid
+    if (*dst != 0xe3a0d442) {
+        puts("Try backup");
+        size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    }
+    
+    cache_clean(dst, PAYLOAD_SIZE);
+    
+    // Jump to the payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();
+    
+    while (1) {}
+}
+```
+
+**Implementation:** `microloader/main.c:31-58`
+
+## Payload Validation
+
+The microloader validates the payload by checking the first instruction:
+
+```c
+if (*dst != 0xe3a0d442) {
+    // Invalid - try backup
+}
+```
+
+**Magic Value:** `0xe3a0d442`
+
+This is the ARM instruction `mov sp, #0x11000000` which should be the first instruction of the LK payload.
+
+**Implementation:** `microloader/main.c:41-44`
+
+<Note>
+If the primary payload is corrupted or erased, the microloader automatically falls back to the backup location. This provides redundancy against accidental payload corruption.
+</Note>
+
+## Device Structure
+
+The microloader uses the same device structure as the LK payload:
+
+```c
+struct device_t {
+    uint32_t unk1;
+    uint32_t unk2;
+    uint32_t unk3;
+    uint32_t unk4;
+    size_t (*read)(struct device_t *dev, uint64_t dev_addr, 
+                   void *dst, uint32_t size, uint32_t part);
+    size_t (*write)(struct device_t *dev, void *src, 
+                    uint64_t block_off, uint32_t size, uint32_t part);
+};
+
+// Function pointer to get device
+struct device_t* (*get_device)() = (void*)0x41E22ED1;
+```
+
+**Implementation:** `lk-payload/common.h:3-12`
+
+## UART Output
+
+The microloader provides minimal UART functions for debugging:
+
+### low_uart_put()
+
+```c
+void low_uart_put(int ch) {
+    volatile uint32_t *uart_reg0 = (volatile uint32_t*)0x11003014;
+    volatile uint32_t *uart_reg1 = (volatile uint32_t*)0x11003000;
+    
+    while (!((*uart_reg0) & 0x20))
+        {}
+    
+    *uart_reg1 = ch;
+}
+```
+
+**Implementation:** `microloader/main.c:6-14`
+
+### putchar()
+
+```c
+int putchar(int character) {
+    if (character == '\n')
+        low_uart_put('\r');
+    low_uart_put(character);
+    return character;
+}
+```
+
+**Implementation:** `microloader/main.c:16-21`
+
+### puts()
+
+```c
+int puts(const char *line) {
+    for (const char *c = line; *c; ++c) {
+        putchar(*c);
+    }
+    putchar('\n');
+    return 0;
+}
+```
+
+**Implementation:** `microloader/main.c:23-29`
+
+<Note>
+The UART hardware is at base address `0x11003000`. Status register at `+0x14` and data register at `+0x00`. Bit 5 of the status register indicates TX ready.
+</Note>
+
+## Cache Management
+
+```c
+void (*cache_clean)(void *addr, size_t sz) = (void*)0x41E231E4;
+
+cache_clean(dst, PAYLOAD_SIZE);
+```
+
+**Implementation:** `microloader/main.c:46`
+
+Cache cleaning ensures the payload data is flushed from cache to memory before execution.
+
+## Installation
+
+The microloader must be installed in the boot image:
+
+### Boot Image Structure
+
+```
+Offset 0x000: Microloader code (max 1KB)
+Offset 0x400: Original boot image header
+Offset 0x800+: Kernel, ramdisk, etc.
+```
+
+The microloader occupies the first 1KB of the boot image, which is normally unused padding before the Android boot image header.
+
+### Installation Process
+
+```python
+import struct
+
+def install_microloader(stage2, microloader_bin, lk_payload_bin):
+    """
+    Install microloader and LK payload to device
+    
+    Args:
+        stage2: Stage2 instance with eMMC access
+        microloader_bin: Compiled microloader binary
+        lk_payload_bin: Compiled LK payload binary
+    """
+    # 1. Read original boot partition
+    stage2.switch_partition(8)  # USER_PART
+    
+    # Find boot partition offset from GPT
+    boot_start = find_partition_start(stage2, 'boot')
+    
+    # Read boot image header (skip first 1KB)
+    stage2.switch_partition(8)
+    boot_blocks = []
+    for i in range(256):  # Read 128KB
+        boot_blocks.append(stage2.read_block(boot_start + i))
+    boot_image = b''.join(boot_blocks)
+    
+    # 2. Inject microloader
+    # Pad microloader to 1KB
+    microloader_padded = microloader_bin.ljust(0x400, b'\x00')
+    
+    # Combine: microloader + original boot image (from offset 0x400)
+    modified_boot = microloader_padded + boot_image[0x400:]
+    
+    # 3. Write modified boot image
+    for i in range(len(modified_boot) // 512):
+        block_data = modified_boot[i*512:(i+1)*512]
+        stage2.write_block(boot_start + i, block_data)
+    
+    # 4. Write LK payload to BOOT0 partition
+    stage2.switch_partition(1)  # BOOT0_PART
+    
+    # Primary location (0x80000 = block 0x400)
+    for i in range(len(lk_payload_bin) // 512):
+        block_data = lk_payload_bin[i*512:(i+1)*512].ljust(512, b'\x00')
+        stage2.write_block(0x400 + i, block_data)
+    
+    # Backup location (0x200000 = block 0x1000)
+    for i in range(len(lk_payload_bin) // 512):
+        block_data = lk_payload_bin[i*512:(i+1)*512].ljust(512, b'\x00')
+        stage2.write_block(0x1000 + i, block_data)
+    
+    print("Microloader and LK payload installed successfully")
+
+# Usage
+with open('microloader.bin', 'rb') as f:
+    microloader = f.read()
+
+with open('lk-payload.bin', 'rb') as f:
+    lk_payload = f.read()
+
+install_microloader(stage2, microloader, lk_payload)
+
+# Reboot device
+stage2.reboot()
+
+# Device will now boot with exploit persistence
+```
+
+## Error Handling
+
+The microloader has minimal error handling:
+
+- If the primary payload fails validation, it tries the backup
+- If both fail, it jumps anyway (likely causing a crash)
+- No timeout or recovery mechanism
+
+```c
+if (*dst != 0xe3a0d442) {
+    puts("Try backup");
+    // Try backup, but don't check if it succeeds
+    dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+}
+
+// Jump regardless of validation
+jump();
+```
+
+**Implementation:** `microloader/main.c:41-51`
+
+<Note>
+The microloader is intentionally minimal to fit in 1KB. It relies on the LK payload backup mechanism to maintain redundancy.
+</Note>
+
+## Debugging
+
+UART output helps debug microloader issues:
+
+### Expected Output
+
+```
+microloader
+Jump
+```
+
+### With Backup Fallback
+
+```
+microloader
+Try backup
+Jump
+```
+
+### Hardware Requirements
+
+To view UART output:
+- Connect UART adapter to device UART pins
+- Baud rate: 921600 (typical for MediaTek)
+- 8N1 (8 data bits, no parity, 1 stop bit)
+
+## Size Constraints
+
+The microloader must fit in 1KB (1024 bytes):
+
+```bash
+$ arm-none-eabi-size microloader.elf
+   text    data     bss     dec     hex filename
+    256       0       0     256     100 microloader.elf
+```
+
+Typical microloader size is ~250 bytes, leaving ample room for expansion.
+
+## Binary Layout
+
+Typical compiled microloader:
+
+```
+0x000: ARM code (entry point)
+0x100: String constants ("microloader", "Try backup", "Jump")
+0x180: Padding to 1KB
+```
+
+## Removal
+
+To remove the exploit:
+
+```python
+def remove_microloader(stage2, original_boot_bin):
+    """
+    Restore original boot image without microloader
+    """
+    boot_start = find_partition_start(stage2, 'boot')
+    
+    stage2.switch_partition(8)
+    for i in range(len(original_boot_bin) // 512):
+        block_data = original_boot_bin[i*512:(i+1)*512]
+        stage2.write_block(boot_start + i, block_data)
+    
+    # Optionally erase LK payload from BOOT0
+    stage2.switch_partition(1)
+    zero_block = b'\x00' * 512
+    for i in range(0x400, 0x400 + 0x100):
+        stage2.write_block(i, zero_block)
+    
+    print("Microloader removed, device will boot normally")
+```
+
+## Communication with LK Payload
+
+The microloader can pass flags to the LK payload via memory:
+
+```c
+// Before jumping, set flag at known address
+uint8_t *flag_addr = (void*)0x41e0062c;
+memcpy(flag_addr, "FASTBOOT_PLEASE", 15);
+
+// Then jump
+jump();
+```
+
+The LK payload checks this address:
+
+```c
+uint8_t *tmp = (void*)0x41e0062c;
+if (strncmp(tmp, "FASTBOOT_PLEASE", 15) == 0) {
+    fastboot = 1;
+}
+```
+
+**Implementation:** `lk-payload/main.c:109-114`
+
+<Note>
+This allows the microloader to influence boot mode without requiring MISC partition access, useful for emergency fastboot access.
+</Note>
+
+## Limitations
+
+- **No storage writes**: Cannot update itself or the LK payload
+- **No error recovery**: Limited error handling due to size constraints
+- **No user interaction**: Cannot present boot menu or accept input
+- **Platform-specific**: Hardcoded addresses work only on specific devices
+
+## Advanced Usage
+
+### Conditional Loading
+
+The microloader could be extended to check conditions before loading:
+
+```c
+// Check volume buttons
+volatile uint32_t *gpio = (volatile uint32_t *)0x10005000;
+if (gpio[0x100/4] & 0x02) {  // Vol+ pressed
+    // Load alternate payload
+    dev->read(dev, ALTERNATE_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+} else {
+    // Normal load
+    dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+}
+```
+
+<Note>
+This would enable boot menu functionality directly in the microloader, but increases size and complexity.
+</Note>
+
+### Multi-stage Loading
+
+For very large payloads, the microloader could implement two-stage loading:
+
+```c
+// Load small stage 2 loader
+dev->read(dev, PAYLOAD_SRC, dst, 0x1000, BOOT0_PART);
+jump();  // Stage 2 loader loads full payload
+```
+
+This allows for payloads larger than the 512KB limit.

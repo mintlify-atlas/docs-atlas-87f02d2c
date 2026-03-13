@@ -1,0 +1,507 @@
+---
+title: Custom Recovery Installation
+description: Install TWRP or other custom recovery images on your MediaTek device
+---
+
+## Overview
+
+With the bootloader unlocked via the Kamakiri exploit, you can install custom recovery images like TWRP (Team Win Recovery Project). Custom recovery provides advanced features for system backup, restoration, and modification.
+
+<Note>
+This guide assumes you have already successfully run the Kamakiri exploit and have an unlocked bootloader. See [Running the Exploit](/guides/running-exploit) and [Bootloader Unlock](/guides/bootloader-unlock) first.
+</Note>
+
+## What is Custom Recovery?
+
+Custom recovery replaces the stock recovery partition with a feature-rich alternative that allows:
+
+- Creating full system backups (NANDroid backups)
+- Flashing custom ROMs, kernels, and modifications
+- Wiping partitions and factory reset
+- Installing ZIP files
+- Accessing ADB with root privileges
+- Mounting and modifying system partitions
+
+## Prerequisites
+
+### Software Requirements
+
+- Unlocked bootloader (via Kamakiri exploit)
+- Fastboot tools installed
+- Custom recovery image (TWRP or compatible)
+
+### Verify Fastboot Access
+
+Ensure your device is recognized:
+
+```bash
+# Boot to fastboot mode
+./boot-fastboot.sh
+
+# Verify device is detected
+fastboot devices
+```
+
+You should see output like:
+
+```
+0123456789ABCDEF    fastboot
+```
+
+## Obtaining Recovery Images
+
+### TWRP for Mantis
+
+You'll need a TWRP image compiled specifically for your device (mantis/AKPGW064GI9HE). 
+
+<Warning>
+Using a recovery image for the wrong device can brick your tablet. Always verify the image is for your specific device model.
+</Warning>
+
+### Building TWRP (Advanced)
+
+If no pre-built image is available, you may need to build TWRP from source using your device tree.
+
+## Flashing Recovery via Fastboot
+
+<Steps>
+  <Step title="Boot to fastboot mode">
+    Enter fastboot mode using one of these methods:
+    
+    ```bash
+    # Method 1: Via boot script
+    ./boot-fastboot.sh
+    
+    # Method 2: Via fastboot command (if already in Android)
+    adb reboot bootloader
+    
+    # Method 3: Hardware button combo (device-specific)
+    ```
+    
+    Verify you see the hacked fastboot message on screen:
+    ```
+    => HACKED FASTBOOT mode: (0) - xyz, k4y0z
+    ```
+  </Step>
+  
+  <Step title="Verify recovery partition size">
+    Check the recovery partition size to ensure your image will fit:
+    
+    ```bash
+    fastboot getvar partition-size:recovery
+    ```
+    
+    Note the size in bytes. Your recovery image must be smaller than this.
+  </Step>
+  
+  <Step title="Flash recovery image">
+    Flash the custom recovery:
+    
+    ```bash
+    fastboot flash recovery twrp-mantis.img
+    ```
+    
+    You should see:
+    ```
+    Sending 'recovery' (XXXXX KB)                      OKAY [  X.XXXs]
+    Writing 'recovery'                                 OKAY [  X.XXXs]
+    Finished. Total time: X.XXXs
+    ```
+  </Step>
+  
+  <Step title="Reboot to recovery">
+    Immediately boot into recovery to test:
+    
+    ```bash
+    fastboot reboot recovery
+    ```
+    
+    Or use the boot script:
+    ```bash
+    ./boot-recovery.sh
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+On first boot after flashing recovery, boot directly to recovery mode. If you boot to system first, Android may overwrite the custom recovery with the stock version.
+</Warning>
+
+## Booting to Recovery
+
+There are multiple methods to boot into custom recovery:
+
+### Method 1: Fastboot Command
+
+From fastboot mode:
+
+```bash
+fastboot reboot recovery
+```
+
+### Method 2: Boot Script
+
+Use the recovery boot script:
+
+```bash
+./boot-recovery.sh
+```
+
+This script:
+1. Enters bootrom mode  
+2. Loads the exploit payload
+3. Sends `FACTORYM` command (boot mode 6)
+4. Triggers recovery boot
+
+```bash
+# From boot-recovery.sh
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+### Method 3: MISC Partition Flag
+
+Set the recovery flag programmatically:
+
+```python
+from modules.functions import force_recovery
+from modules.common import Device
+from modules.load_payload import load_payload
+from modules.functions import parse_gpt, switch_user
+
+dev = Device()
+dev.find_device()
+load_payload(dev)
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+force_recovery(dev, gpt)
+dev.reboot()
+```
+
+The `force_recovery` function writes `boot-recovery` to MISC:
+
+```python
+# From modules/functions.py:95-100
+def force_recovery(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "boot-recovery\x00\x00\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+    block = dev.emmc_read(gpt["MISC"][0])
+```
+
+The lk-payload detects this flag:
+
+```c
+// From lk-payload/main.c:167-173
+else if(strncmp(bootloader_msg, "boot-recovery", 13) == 0) {
+  *g_boot_mode = 2;
+  // reset flag
+  memset(bootloader_msg, 0, 0x10);
+  dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+```
+
+### Method 4: ADB Command
+
+If you have ADB access in Android:
+
+```bash
+adb reboot recovery
+```
+
+## Booting Recovery Temporarily
+
+You can test a recovery image without flashing it:
+
+```bash
+fastboot boot twrp-mantis.img
+```
+
+This boots the image from RAM without writing to the recovery partition. Useful for:
+- Testing recovery images before permanent installation
+- One-time recovery access without modifying the device
+- Recovering from a bad recovery flash
+
+## Using Custom Recovery
+
+### First Boot
+
+On first boot to TWRP, you may see:
+
+```
+TWRP can modify the system partition to prevent the stock ROM from 
+replacing TWRP. Keep Read-Only?
+```
+
+Select **"Swipe to Allow Modifications"** to enable full TWRP functionality.
+
+### Common TWRP Operations
+
+#### Create a Backup
+
+<Steps>
+  <Step title="Navigate to Backup">
+    Tap **Backup** on the main TWRP screen.
+  </Step>
+  
+  <Step title="Select partitions">
+    Choose which partitions to back up:
+    - Boot (kernel)
+    - System (OS)
+    - Data (user data)
+    - Recovery (optional)
+  </Step>
+  
+  <Step title="Swipe to backup">
+    Swipe the slider to start the backup. This creates a NANDroid backup you can restore later.
+  </Step>
+</Steps>
+
+#### Flash a ZIP File
+
+<Steps>
+  <Step title="Transfer file to device">
+    ```bash
+    adb push custom-rom.zip /sdcard/
+    ```
+  </Step>
+  
+  <Step title="Navigate to Install">
+    Tap **Install** in TWRP.
+  </Step>
+  
+  <Step title="Select ZIP">
+    Browse to the ZIP file and select it.
+  </Step>
+  
+  <Step title="Swipe to flash">
+    Swipe the slider to flash the ZIP.
+  </Step>
+</Steps>
+
+#### Wipe Partitions
+
+<Steps>
+  <Step title="Navigate to Wipe">
+    Tap **Wipe** on the main screen.
+  </Step>
+  
+  <Step title="Select wipe type">
+    - **Basic**: Wipe cache, dalvik, data (factory reset)
+    - **Advanced**: Select specific partitions
+    - **Format Data**: Complete wipe including internal storage
+  </Step>
+  
+  <Step title="Swipe to wipe">
+    Confirm the wipe operation.
+  </Step>
+</Steps>
+
+#### ADB Access in Recovery
+
+TWRP provides ADB access with root privileges:
+
+```bash
+# Check connection
+adb devices
+
+# Open root shell
+adb shell
+
+# Pull files from device
+adb pull /data/media/0/file.txt
+
+# Push files to device  
+adb push file.txt /sdcard/
+```
+
+## Advanced Recovery Operations
+
+### Mount System as Read-Write
+
+In TWRP:
+
+1. Tap **Mount**
+2. Check **System**
+3. Tap **Mount system partition read-only** to toggle to read-write
+
+Or via ADB:
+
+```bash
+adb shell
+mount -o rw,remount /system
+```
+
+### Modify System Files
+
+```bash
+adb shell
+cd /system
+# Make modifications
+# For example, remove bloatware:
+rm -rf /system/app/UnwantedApp
+```
+
+### Fix Permissions
+
+If you encounter permission issues after modifications:
+
+In TWRP: **Advanced** → **Fix Permissions**
+
+### Terminal in Recovery
+
+TWRP includes a terminal:
+
+1. Tap **Advanced**
+2. Tap **Terminal**
+3. Execute shell commands directly on device
+
+## Troubleshooting
+
+### Recovery Won't Boot
+
+If recovery fails to boot after flashing:
+
+1. **Re-flash recovery**:
+   ```bash
+   fastboot flash recovery twrp-mantis.img
+   fastboot reboot recovery
+   ```
+
+2. **Boot temporarily**:
+   ```bash
+   fastboot boot twrp-mantis.img
+   ```
+
+3. **Check image compatibility**: Ensure the recovery is built for your device
+
+### Stock Recovery Returns After Reboot
+
+Android may restore stock recovery on boot. To prevent this:
+
+1. **Flash TWRP again**
+2. **Immediately boot to recovery** (don't boot system first)
+3. **Modify /system**: TWRP can patch system to prevent stock recovery restoration
+
+### Recovery Bootloop
+
+If device loops in recovery:
+
+1. **Clear MISC flags**:
+   ```bash
+   # Re-run exploit to clear boot flags
+   ./bootrom-step.sh
+   ```
+
+2. **Flash stock recovery**:
+   ```bash
+   fastboot flash recovery stock-recovery.img
+   fastboot reboot
+   ```
+
+### Touch Not Working in Recovery
+
+If touchscreen doesn't work in TWRP:
+
+- Use volume buttons to navigate (up/down)
+- Use power button to select
+- Try a different TWRP build with proper touch drivers
+
+### ADB Not Working in Recovery
+
+```bash
+# On device, in TWRP:
+# Advanced → ADB Sideload → Swipe to start
+
+# On computer:
+adb devices
+```
+
+If still not working:
+- Try different USB port
+- Install proper drivers (Windows)
+- Check USB debugging is enabled in recovery settings
+
+## Restoring Stock Recovery
+
+To return to stock recovery:
+
+<Steps>
+  <Step title="Obtain stock recovery">
+    Extract `recovery.img` from stock firmware or create a backup before flashing custom recovery.
+  </Step>
+  
+  <Step title="Boot to fastboot">
+    ```bash
+    ./boot-fastboot.sh
+    ```
+  </Step>
+  
+  <Step title="Flash stock recovery">
+    ```bash
+    fastboot flash recovery stock-recovery.img
+    fastboot reboot
+    ```
+  </Step>
+</Steps>
+
+## Best Practices
+
+### Always Create Backups
+
+Before major modifications:
+
+```
+TWRP → Backup → Select all partitions → Swipe to Backup
+```
+
+Store backups on external storage or computer:
+
+```bash
+adb pull /sdcard/TWRP/BACKUPS/ ./backup/
+```
+
+### Verify Checksums
+
+Before flashing:
+
+```bash
+md5sum twrp-mantis.img
+sha256sum twrp-mantis.img
+```
+
+Compare with official checksums.
+
+### Test Before Flashing
+
+Always test with `fastboot boot` first:
+
+```bash
+fastboot boot twrp-mantis.img
+```
+
+Only flash permanently after confirming it works.
+
+### Keep Multiple Recovery Options
+
+- Keep stock recovery image backed up
+- Keep TWRP image on computer for re-flashing
+- Know how to enter bootrom mode to re-run exploit if needed
+
+## Next Steps
+
+With custom recovery installed, you can:
+
+- Flash custom ROMs (LineageOS, etc.)
+- Install root (Magisk)
+- Create full system backups
+- Modify system files
+- Install custom kernels
+- Flash mods and tweaks via ZIP files
+
+<Warning>
+Always research before flashing. Installing incompatible software can brick your device. When in doubt, create a backup first.
+</Warning>

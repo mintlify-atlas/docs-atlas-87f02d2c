@@ -1,0 +1,507 @@
+---
+title: Quickstart Guide
+description: Step-by-step guide to run the Kamakiri bootrom exploit for the first time
+---
+
+## Overview
+
+This guide will walk you through running the Kamakiri exploit to gain bootrom-level access to your MediaTek device. The exploit process involves:
+
+1. Detecting the device in bootrom mode
+2. Injecting custom payloads via USB serial
+3. Downgrading vulnerable firmware components
+4. Installing TWRP recovery for persistent root access
+
+<Warning>
+This exploit involves low-level firmware modifications. **Ensure you have backups** and understand that there is a risk of bricking your device. Only proceed if you've verified device compatibility in [Prerequisites](/getting-started/prerequisites).
+</Warning>
+
+## Before You Begin
+
+<Steps>
+
+<Step title="Complete prerequisites">
+
+Ensure you've completed:
+
+- [Prerequisites](/getting-started/prerequisites) - Hardware and software requirements
+- [Installation](/getting-started/installation) - Built all payloads and dependencies
+
+</Step>
+
+<Step title="Disable ModemManager (Linux only)">
+
+```bash
+sudo systemctl stop ModemManager
+```
+
+The exploit script will check for this automatically.
+
+</Step>
+
+<Step title="Prepare your device">
+
+- **Charge the device** to at least 50% battery
+- **Enable USB debugging** (if accessible)
+- Have a USB cable ready for connection
+
+</Step>
+
+</Steps>
+
+## Running the Exploit
+
+### Step 1: Enter Bootrom Mode
+
+The exploit requires the device to be in bootrom mode (USB VID `0e8d`, PID `0003`).
+
+<Steps>
+
+<Step title="Power off the device completely">
+
+Hold the power button until the device shuts down.
+
+</Step>
+
+<Step title="Connect USB cable to computer">
+
+Connect one end of the USB cable to your computer. **Do not connect to the device yet.**
+
+</Step>
+
+<Step title="Boot into bootrom mode">
+
+This varies by device:
+
+- **Most devices**: Hold **Volume Down** while connecting USB cable
+- **Some devices**: Hold **Volume Down + Power** while connecting USB
+
+The device should appear as a MediaTek USB device without showing any screen activity.
+
+</Step>
+
+<Step title="Verify bootrom mode (optional)">
+
+```bash
+# Linux
+lsusb | grep 0e8d
+
+# macOS  
+system_profiler SPUSBDataType | grep -A 5 MediaTek
+```
+
+You should see a MediaTek device with ID `0e8d:0003`.
+
+</Step>
+
+</Steps>
+
+### Step 2: Run the Bootrom Exploit
+
+Execute the main exploit script:
+
+```bash
+./bootrom-step.sh
+```
+
+This script runs `modules/main.py` which performs the full exploit chain.
+
+<Info>
+The script will automatically detect when your device is connected. You'll see "Waiting for device" until the MediaTek bootrom is detected.
+</Info>
+
+### Expected Output
+
+The exploit will proceed through multiple stages:
+
+```bash
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyACM0
+[INFO] Loading payload from ../brom-payload/stage1/stage1.bin
+[INFO] Kamakiri!
+[INFO] Handshake
+[INFO] Disable WDT
+[INFO] Disable caches
+[INFO] Load stage2
+[INFO] Loading payload from ../brom-payload/stage2/stage2.bin
+[INFO] Check device_type_id
+[INFO] Detected mantis (AKPGW064GI9HE)
+[INFO] Check GPT
+[INFO] gpt_parsed = {'lk': (1024, 1024), 'tee1': (2048, 512), ...}
+[INFO] Check boot0
+[INFO] Check rpmb
+[INFO] Downgrade rpmb
+[INFO] Recheck rpmb
+[INFO] rpmb downgrade ok
+[INFO] Flash tz
+[INFO] Flash lk
+[INFO] Flash lk-payload
+[INFO] Inject microloader
+[INFO] Force fastboot
+[INFO] Flash preloader
+[INFO] Reboot
+```
+
+<Warning>
+If you see "Wrong device detected" the exploit will abort. This means your device is not compatible. **Do not proceed.**
+</Warning>
+
+### Understanding the Exploit Process
+
+The exploit performs these operations:
+
+<AccordionGroup>
+
+<Accordion title="1. Device Detection and Payload Injection">
+
+The script detects the device in bootrom mode and injects `stage1.bin`:
+
+- Performs bootrom handshake sequence (`0xa0 0x5f 0x0a 0xf5 0x50 0xaf 0x05 0xfa`)
+- Exploits bootrom vulnerability to load custom code
+- Loads `stage2.bin` with full eMMC read/write capabilities
+
+</Accordion>
+
+<Accordion title="2. GPT Validation">
+
+Verifies the partition table has required partitions:
+
+- `lk` - Little Kernel bootloader
+- `tee1` - TrustZone trusted execution environment  
+- `boot` - Android boot image
+- `recovery` - Recovery partition
+
+If GPT is corrupted, use `./gpt-fix.sh fixgpt` to repair.
+
+</Accordion>
+
+<Accordion title="3. RPMB Downgrade">
+
+**RPMB (Replay Protected Memory Block)** prevents firmware downgrades.
+
+The exploit:
+
+1. Reads current RPMB state
+2. Zeros out RPMB counters (`0x00 * 0x100`)
+3. Verifies downgrade succeeded
+
+This allows flashing older vulnerable firmware.
+
+</Accordion>
+
+<Accordion title="4. Firmware Downgrade">
+
+Flashes vulnerable versions of:
+
+- **TrustZone** (`tz.img`) - Removes boot verification
+- **LK bootloader** (`lk.bin`) - Enables fastboot access
+- **LK payload** - Hooks bootloader to force fastboot mode
+- **Microloader** - Hijacks boot partition to intercept boot process
+- **Preloader** (if needed) - Modified preloader for persistence
+
+</Accordion>
+
+<Accordion title="5. Reboot to Fastboot">
+
+Device reboots into fastboot mode automatically, ready for recovery flashing.
+
+</Accordion>
+
+</AccordionGroup>
+
+### Step 3: Flash TWRP Recovery
+
+After the exploit completes, the device will reboot into **fastboot mode**.
+
+<Steps>
+
+<Step title="Wait for fastboot mode">
+
+The device screen should show:
+
+```
+=> FASTBOOT mode...
+```
+
+Verify fastboot connection:
+
+```bash
+fastboot devices
+```
+
+Expected output:
+
+```
+ABCD1234    fastboot
+```
+
+</Step>
+
+<Step title="Flash TWRP recovery">
+
+Run the fastboot script:
+
+```bash
+./fastboot-step.sh
+```
+
+This executes:
+
+```bash
+fastboot flash recovery bin/twrp.img
+fastboot oem reboot-recovery
+```
+
+</Step>
+
+<Step title="Boot into TWRP">
+
+The device will automatically reboot into TWRP recovery.
+
+</Step>
+
+</Steps>
+
+### Expected Output
+
+```bash
+Sending 'recovery' (24576 KB)                      OKAY [  1.234s]
+Writing 'recovery'                                 OKAY [  0.567s]
+Finished. Total time: 1.801s
+Rebooting into recovery                            OKAY [  0.001s]
+Finished. Total time: 0.001s
+
+Your device will now reboot into TWRP.
+```
+
+## Troubleshooting
+
+### Device Not Detected
+
+**Symptom:** Script shows "Waiting for device" indefinitely.
+
+**Solutions:**
+
+<AccordionGroup>
+
+<Accordion title="Check USB connection">
+
+1. Try a different USB cable (must support data transfer)
+2. Try a different USB port (prefer USB 2.0 ports)
+3. Avoid USB hubs - connect directly to computer
+
+</Accordion>
+
+<Accordion title="Verify bootrom mode">
+
+Check if device is detected:
+
+```bash
+# Linux
+lsusb | grep 0e8d
+
+# Check dmesg for USB events
+dmesg | tail -n 20
+```
+
+Look for MediaTek device with VID `0e8d`.
+
+</Accordion>
+
+<Accordion title="Check permissions (Linux)">
+
+Ensure udev rules are installed:
+
+```bash
+cat /etc/udev/rules.d/51-mediatek.rules
+```
+
+Reload rules:
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Disconnect and reconnect device.
+
+</Accordion>
+
+<Accordion title="ModemManager interference">
+
+```bash
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+
+Then retry the exploit.
+
+</Accordion>
+
+</AccordionGroup>
+
+### Wrong Device Detected
+
+**Symptom:** `Wrong device detected: <device_type_id>`
+
+**Cause:** Your device is not compatible with this exploit.
+
+**Solution:** This exploit only works on specific devices (see [Prerequisites](/getting-started/prerequisites)). Do not attempt to bypass this check.
+
+### RPMB Downgrade Failure
+
+**Symptom:** `downgrade failure, giving up`
+
+**Solutions:**
+
+1. **Device already exploited:** If you've run the exploit before, RPMB may already be zeroed. When prompted, press Enter to continue.
+
+2. **RPMB hardware issue:** Reboot and retry:
+   ```bash
+   ./bootrom-step.sh
+   ```
+
+3. **Persistent failures:** Your RPMB may be locked or damaged. Consult device-specific forums.
+
+### Fastboot Not Responding
+
+**Symptom:** `fastboot devices` shows no devices after exploit.
+
+**Solutions:**
+
+<AccordionGroup>
+
+<Accordion title="Wait longer">
+
+Device may take 30-60 seconds to boot into fastboot mode after reboot.
+
+</Accordion>
+
+<Accordion title="Check fastboot installation">
+
+```bash
+fastboot --version
+```
+
+Reinstall if needed:
+
+```bash
+# Debian/Ubuntu
+sudo apt install android-tools-fastboot
+
+# macOS
+brew install android-platform-tools
+```
+
+</Accordion>
+
+<Accordion title="Manual fastboot boot">
+
+If device didn't auto-boot to fastboot:
+
+1. Power off device
+2. Hold **Volume Down** while powering on
+3. Select "Fastboot" from boot menu (if available)
+
+</Accordion>
+
+</AccordionGroup>
+
+### Preloader Mode Instead of Bootrom
+
+**Symptom:** Device detected in preloader mode instead of bootrom.
+
+**Solution:** The exploit supports preloader mode with the `crash` argument:
+
+```bash
+cd modules
+python3 main.py crash
+```
+
+This crashes the preloader to drop back into bootrom mode, then runs the exploit.
+
+### GPT Corruption
+
+**Symptom:** `RuntimeError: bad gpt`
+
+**Solution:** Fix the GPT partition table:
+
+```bash
+./gpt-fix.sh
+```
+
+This will reflash the correct GPT for your device model.
+
+## Advanced Usage
+
+### Running from Preloader Mode
+
+If your device boots into preloader instead of bootrom:
+
+```bash
+cd modules
+python3 main.py crash
+cd ..
+```
+
+This crashes the preloader to drop into bootrom, then runs the exploit.
+
+### Fixing GPT Only
+
+To only repair the GPT partition table without running full exploit:
+
+```bash
+./gpt-fix.sh
+```
+
+### Boot Directly to Recovery
+
+After TWRP is installed, boot to recovery:
+
+```bash
+./boot-recovery.sh
+```
+
+This sends the `FACTORYM` command to preloader to boot recovery mode.
+
+### Boot to Fastboot
+
+Force boot to fastboot mode:
+
+```bash
+./boot-fastboot.sh  
+```
+
+This sends the `FACTFACT` command to preloader.
+
+## What's Next?
+
+After successfully running the exploit and flashing TWRP:
+
+1. **Install Magisk** - For root access and module support
+2. **Flash custom ROM** - Install LineageOS or other custom firmware
+3. **Backup partitions** - Use TWRP to backup critical partitions
+4. **Install custom kernel** - Apply the included `kernel.patch` for additional features
+
+<Info>
+You now have full bootrom-level access to your device. Handle with care - you can unbrick most software issues, but hardware-level protection is bypassed.
+</Info>
+
+## Additional Resources
+
+- [Architecture](/technical/architecture) - Understand how the exploit works
+- [Payload Development](/advanced/building-payloads) - Build custom payloads
+- [API Reference](/api/device) - Python API documentation
+
+## Getting Help
+
+If you encounter issues:
+
+1. Check the troubleshooting sections above
+2. Review device-specific forums (XDA Developers)
+3. Ensure you're using the correct binary files for your device
+4. Verify all prerequisites are met
+
+<Warning>
+Never flash binary files from unknown sources. Always verify checksums and source from trusted community members.
+</Warning>

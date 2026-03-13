@@ -1,0 +1,542 @@
+---
+title: 'Troubleshooting'
+description: 'Common errors, debugging techniques, and recovery procedures'
+---
+
+## Common Build Errors
+
+<AccordionGroup>
+  <Accordion title="arm-none-eabi-gcc: command not found">
+    **Problem:** ARM toolchain not installed or not in PATH.
+
+    **Solution:**
+
+    ```bash
+    # Ubuntu/Debian
+    sudo apt-get install gcc-arm-none-eabi binutils-arm-none-eabi
+
+    # Arch Linux
+    sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
+
+    # macOS
+    brew install --cask gcc-arm-embedded
+    ```
+
+    Verify installation:
+
+    ```bash
+    arm-none-eabi-gcc --version
+    ```
+
+    If still not found, check PATH:
+
+    ```bash
+    export PATH="$PATH:/usr/bin:/usr/local/bin"
+    ```
+  </Accordion>
+
+  <Accordion title="relocation truncated to fit: R_ARM_THM_JUMP24">
+    **Problem:** Stage 1 payload exceeds 2560 bytes (0xA00).
+
+    **Error Message:**
+    ```
+    /usr/lib/gcc/arm-none-eabi/10.3.1/../../../../arm-none-eabi/bin/ld:
+    stage1/stage1.elf section `.text' will not fit in region `FLASH'
+    ```
+
+    **Solution:**
+
+    1. Check payload size:
+       ```bash
+       ls -lh brom-payload/stage1/stage1.bin
+       ```
+
+    2. Remove debug strings from `stage1.c`
+    3. Move functionality to stage 2
+    4. Verify `-Os` optimization flag is set
+    5. Check for unused code being linked
+
+    **Prevention:**
+    Keep stage 1 minimal - only handle USB response and load stage 2.
+  </Accordion>
+
+  <Accordion title="undefined reference to `__aeabi_uidiv'">
+    **Problem:** Missing GCC runtime library for division operations.
+
+    **Solution:**
+
+    Ensure LDFLAGS includes `-lgcc`:
+
+    ```makefile
+    LDFLAGS := -nodefaultlibs -nostdlib -lgcc
+    ```
+
+    Clean and rebuild:
+
+    ```bash
+    make clean
+    make
+    ```
+  </Accordion>
+
+  <Accordion title="section `.text' will not fit in region">
+    **Problem:** Payload code exceeds memory region defined in linker script.
+
+    **Solution:**
+
+    Check linker script memory regions:
+
+    ```bash
+    # For stage1 - must fit in 0xA00 bytes
+    cat brom-payload/stage1.ld
+
+    # For stage2 - check available SRAM
+    cat brom-payload/stage2.ld
+    ```
+
+    View section sizes:
+
+    ```bash
+    arm-none-eabi-size stage1/stage1.elf
+    ```
+  </Accordion>
+
+  <Accordion title="multiple definition of `main'">
+    **Problem:** Multiple source files define `main()` function.
+
+    **Solution:**
+
+    Each payload stage should have only one `main()` function:
+
+    - Stage 1: `stage1.c` only
+    - Stage 2: `stage2.c` only
+    - PL: `pl.c` only
+
+    Check Makefile source lists:
+
+    ```makefile
+    STAGE1_SRC = stage1.c brom_common.c common.c
+    # Do not include stage2.c or pl.c
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Runtime Errors
+
+<AccordionGroup>
+  <Accordion title="RuntimeError: Serial protocol mismatch">
+    **Error Message:**
+    ```python
+    RuntimeError: ERROR: Serial protocol mismatch, expected b'5f' got b'00'
+    ```
+
+    **Problem:** Device not responding to handshake, or wrong bootrom mode.
+
+    **Solution:**
+
+    1. Verify device is in bootrom mode (powered off, Vol+ held)
+    2. Check USB connection:
+       ```bash
+       lsusb | grep 0e8d
+       ```
+    3. Ensure ModemManager is disabled:
+       ```bash
+       sudo systemctl stop ModemManager
+       sudo systemctl disable ModemManager
+       ```
+    4. Try different USB port or cable
+    5. Power cycle device completely
+
+    See: `modules/common.py:101-107`
+  </Accordion>
+
+  <Accordion title="RuntimeError: received b'...' instead of expected pattern">
+    **Error Messages:**
+    ```python
+    RuntimeError: received b'\x00\x00\x00\x00' instead of expected pattern
+    RuntimeError: received b'\xA1\xA2\xA4\xA3' instead of expected pattern
+    ```
+
+    **Problem:** Payload failed to load or crashed during execution.
+
+    **Cause Analysis:**
+
+    - **Stage 1:** Expected `b"\xA1\xA2\xA3\xA4"` (see `stage1.c:24`)
+    - **Stage 2:** Expected `b"\xB1\xB2\xB3\xB4"` (see `stage2.c` + `payload_common.c`)
+    - **PL:** Expected `b"\xB1\xB2\xB3\xB4"` (see `pl.c`)
+
+    **Solution:**
+
+    1. Rebuild payloads:
+       ```bash
+       cd brom-payload
+       make clean
+       make
+       ```
+    2. Verify payload integrity:
+       ```bash
+       sha256sum stage1/stage1.bin
+       # Compare with known-good hash
+       ```
+    3. Check for payload corruption during transfer
+    4. Verify payload size constraints (stage1 < 2560 bytes)
+
+    See: `modules/load_payload.py:96-98`, `modules/load_payload.py:135-137`
+  </Accordion>
+
+  <Accordion title="RuntimeError: payload too large">
+    **Error Message:**
+    ```python
+    RuntimeError: payload too large
+    ```
+
+    **Problem:** Stage 1 payload exceeds 2560 bytes (0xA00).
+
+    **Solution:**
+
+    1. Check payload size:
+       ```bash
+       ls -l brom-payload/stage1/stage1.bin
+       ```
+    2. Rebuild with optimization:
+       ```bash
+       make clean
+       CFLAGS="-Os -g0" make
+       ```
+    3. Remove debug code and strings from `stage1.c`
+
+    See: `modules/load_payload.py:35-36`
+  </Accordion>
+
+  <Accordion title="RuntimeError: bad gpt">
+    **Error Message:**
+    ```python
+    RuntimeError: bad gpt
+    ```
+
+    **Problem:** GPT partition table is missing required partitions.
+
+    **Required partitions:**
+    - `lk` - Little Kernel bootloader
+    - `tee1` - Trusted execution environment
+    - `boot` - Boot partition
+    - `recovery` - Recovery partition
+
+    **Solution:**
+
+    1. Check GPT structure:
+       ```bash
+       # This is done automatically in main.py
+       ```
+    2. If GPT is corrupted, fix with:
+       ```bash
+       python3 modules/main.py fixgpt
+       ```
+    3. If using unsupported device, GPT structure may differ
+
+    See: `modules/main.py:48-51`
+  </Accordion>
+
+  <Accordion title="RuntimeError: what's wrong with your BOOT0?">
+    **Error Message:**
+    ```python
+    RuntimeError: what's wrong with your BOOT0?
+    ```
+
+    **Problem:** BOOT0 partition signature invalid.
+
+    **Expected:** First 9 bytes should be `b"EMMC_BOOT"` or all zeros.
+
+    **Solution:**
+
+    1. BOOT0 may be corrupted - this is dangerous
+    2. Do NOT proceed without backup
+    3. Check if device has been modified before
+    4. Consider using preloader mode instead
+
+    See: `modules/functions.py:36-41`
+  </Accordion>
+
+  <Accordion title="RuntimeError: what's wrong with your GPT?">
+    **Error Message:**
+    ```python
+    RuntimeError: what's wrong with your GPT?
+    ```
+
+    **Problem:** GPT signature (0x55AA) missing from MBR.
+
+    **Solution:**
+
+    1. User partition is corrupted
+    2. Run GPT fix:
+       ```bash
+       python3 modules/main.py fixgpt
+       ```
+    3. If fix fails, device may need factory restore
+
+    See: `modules/functions.py:109-114`
+  </Accordion>
+
+  <Accordion title="RuntimeError: downgrade failure, giving up">
+    **Error Message:**
+    ```python
+    RuntimeError: downgrade failure, giving up
+    ```
+
+    **Problem:** RPMB write verification failed.
+
+    **Solution:**
+
+    1. Device automatically reboots for safety
+    2. Wait for reboot to complete
+    3. Retry exploit from beginning:
+       ```bash
+       python3 modules/main.py
+       ```
+    4. If repeated failures, RPMB hardware may be faulty
+
+    See: `modules/main.py:68-75`
+  </Accordion>
+
+  <Accordion title="rpmb looks broken">
+    **Warning Message:**
+    ```
+    rpmb looks broken; if this is expected (i.e. you're retrying the exploit)
+    press enter, otherwise terminate with Ctrl+C
+    ```
+
+    **Problem:** RPMB doesn't start with `b"AMZN"` signature.
+
+    **When This Is Normal:**
+    - Retrying exploit after failure
+    - Previous exploit attempt was interrupted
+    - RPMB was already wiped
+
+    **When This Is Dangerous:**
+    - First time running exploit
+    - Device has never been modified
+    - Unknown device history
+
+    **Solution:**
+
+    If expected: Press Enter to continue
+    If unexpected: Press Ctrl+C and investigate
+
+    See: `modules/main.py:59-65`
+  </Accordion>
+</AccordionGroup>
+
+## USB Connection Issues
+
+<AccordionGroup>
+  <Accordion title="Device not detected">
+    **Problem:** `lsusb` doesn't show MediaTek device (VID 0e8d).
+
+    **Solution:**
+
+    1. Verify device is powered off completely
+    2. Hold Volume Up button
+    3. Connect USB cable while holding button
+    4. Check USB connection:
+       ```bash
+       lsusb | grep -i mediatek
+       # Should show: Bus 001 Device XXX: ID 0e8d:XXXX MediaTek Inc.
+       ```
+    5. Try different USB port (prefer USB 2.0)
+    6. Try different USB cable
+    7. Check dmesg for errors:
+       ```bash
+       sudo dmesg | tail -n 50
+       ```
+  </Accordion>
+
+  <Accordion title="Permission denied opening /dev/ttyUSB*">
+    **Problem:** User lacks permissions for serial device.
+
+    **Solution:**
+
+    ```bash
+    # Add user to dialout group
+    sudo usermod -a -G dialout $USER
+
+    # Log out and log back in for changes to take effect
+    # Or in current shell:
+    newgrp dialout
+
+    # Verify permissions
+    ls -l /dev/ttyUSB0
+    ```
+  </Accordion>
+
+  <Accordion title="ModemManager interfering">
+    **Error Message:**
+    ```
+    You need to temporarily disable/uninstall ModemManager before this
+    script can proceed
+    ```
+
+    **Problem:** ModemManager is claiming MediaTek serial device.
+
+    **Solution:**
+
+    ```bash
+    # Temporary disable
+    sudo systemctl stop ModemManager
+
+    # Permanent disable
+    sudo systemctl disable ModemManager
+
+    # Or uninstall
+    sudo apt-get remove modemmanager  # Ubuntu/Debian
+    sudo pacman -R modemmanager        # Arch Linux
+    ```
+
+    See: `modules/functions.py:24-34`
+  </Accordion>
+</AccordionGroup>
+
+## Recovery Procedures
+
+### Device Won't Boot After Exploit
+
+<Steps>
+  <Step title="Enter Bootrom Mode">
+    Power off device completely, hold Vol+, connect USB.
+  </Step>
+  
+  <Step title="Run Exploit Again">
+    ```bash
+    python3 modules/main.py
+    ```
+    Device should respond to serial commands even if software is broken.
+  </Step>
+  
+  <Step title="Flash Stock Firmware">
+    Use SP Flash Tool or fastboot to restore stock firmware after unlocking bootloader.
+  </Step>
+</Steps>
+
+### Corrupted GPT
+
+```bash
+# Fix GPT using built-in repair
+python3 modules/main.py fixgpt
+```
+
+This flashes a known-good GPT from `bin/gpt-mantis.bin`.
+
+See: `modules/main.py:38-41`, `makedist.sh:32-34`
+
+### Device Stuck in Preloader
+
+<Steps>
+  <Step title="Detect Preloader Mode">
+    Device shows different USB PID when in preloader mode.
+    
+    ```bash
+    lsusb | grep 0e8d
+    # In preloader: different PID than 0003
+    ```
+  </Step>
+  
+  <Step title="Crash to Bootrom">
+    ```bash
+    python3 modules/main.py crash
+    ```
+    
+    This crashes preloader to drop back to bootrom mode.
+    
+    See: `modules/main.py:126-133`, `modules/common.py:351-357`
+  </Step>
+  
+  <Step title="Run Normal Exploit">
+    Once in bootrom mode, run normal exploit.
+  </Step>
+</Steps>
+
+### RPMB Write Failure
+
+If RPMB write fails repeatedly:
+
+1. Device automatically reboots for safety
+2. Wait 30 seconds for complete reboot
+3. Try exploit again from bootrom mode
+4. If persistent, RPMB hardware may be faulty
+
+## Debug Techniques
+
+### Enable Verbose Logging
+
+Edit `modules/logger.py` to increase verbosity:
+
+```python
+def log(msg):
+    print(f"[{time.time()}] {msg}")
+```
+
+### Monitor Serial Communication
+
+```bash
+# Watch USB device enumeration
+watch -n 0.5 lsusb
+
+# Monitor kernel messages
+sudo dmesg -w
+
+# Monitor serial traffic (advanced)
+sudo cat /dev/ttyUSB0 | hexdump -C
+```
+
+### Verify Payload Loading
+
+Add debug output to payloads:
+
+```c
+// In stage1.c
+print("Checkpoint 1\n");
+send_dword(0xDEADBEEF);  // Custom debug marker
+print("Checkpoint 2\n");
+```
+
+Monitor in Python:
+
+```python
+data = dev.dev.read(4)
+print(f"Received: {data.hex()}")
+```
+
+### Disassemble Payloads
+
+```bash
+# View full disassembly
+arm-none-eabi-objdump -d brom-payload/stage1/stage1.elf > stage1.asm
+
+# Check symbol table
+arm-none-eabi-nm brom-payload/stage1/stage1.elf
+
+# View sections and sizes
+arm-none-eabi-size -A -x brom-payload/stage1/stage1.elf
+```
+
+## Getting Help
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/amonet-kamakiri/kamakiri">
+    Report bugs and request features
+  </Card>
+  <Card title="Development Guide" icon="code" href="/advanced/development">
+    Learn to contribute fixes
+  </Card>
+</CardGroup>
+
+## Known Limitations
+
+<Warning>
+**Device Support:** Kamakiri only supports specific MediaTek devices. Attempting to run on unsupported devices may cause permanent damage.
+</Warning>
+
+**Verified Devices:**
+- Amazon Fire HD 8 (mantis) - device_type_id: `AKPGW064GI9HE`
+
+**Required Checks:**
+See: `modules/main.py:29-36` for device verification logic.

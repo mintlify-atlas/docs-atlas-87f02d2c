@@ -1,0 +1,167 @@
+---
+title: Prerequisites
+description: Hardware requirements, software dependencies, and device compatibility for Kamakiri
+---
+
+## Device Compatibility
+
+Kamakiri is a bootrom exploit specifically designed for MediaTek-based devices. The exploit has been tested and confirmed working on:
+
+- **Amazon Fire tablets** with MediaTek MT8163/MT8173 SoCs
+- Devices with **device_type_id**: `AKPGW064GI9HE` (Mantis)
+
+<Warning>
+This exploit only works on specific MediaTek chipsets with vulnerable bootrom. Running this exploit on incompatible devices may result in a bricked device. Always verify your device compatibility before proceeding.
+</Warning>
+
+## Hardware Requirements
+
+### Essential Hardware
+
+- **Compatible MediaTek device** (see Device Compatibility above)
+- **USB cable** for connecting device to computer
+- **Host computer** running Linux (recommended) or macOS
+
+### USB Connection
+
+The exploit communicates with the device over USB serial:
+
+- **Vendor ID**: `0E8D` (MediaTek)
+- **Product ID**: `0003` (Bootrom mode)
+- The device must be in bootrom or preloader mode to accept payloads
+
+<Note>
+Ensure your USB cable supports data transfer, not just charging. Poor quality cables can cause communication failures during the exploit.
+</Note>
+
+## Software Dependencies
+
+### System Packages
+
+Before installing Python dependencies, ensure you have the following system packages:
+
+#### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install -y \
+  python3 python3-pip \
+  gcc-arm-none-eabi \
+  binutils-arm-none-eabi \
+  android-tools-adb android-tools-fastboot \
+  make git
+```
+
+#### Linux (Fedora/RHEL)
+
+```bash
+sudo dnf install -y \
+  python3 python3-pip \
+  arm-none-eabi-gcc-cs \
+  arm-none-eabi-binutils \
+  android-tools \
+  make git
+```
+
+#### macOS
+
+```bash
+brew install python3 \
+  arm-none-eabi-gcc \
+  android-platform-tools \
+  make git
+```
+
+### ARM Cross-Compiler Toolchain
+
+The exploit requires the **ARM Embedded GCC toolchain** to build bootrom payloads:
+
+- `arm-none-eabi-gcc` - ARM C compiler (targeting Cortex-A9)
+- `arm-none-eabi-as` - ARM assembler  
+- `arm-none-eabi-ld` - ARM linker
+- `arm-none-eabi-objcopy` - Binary conversion utility
+
+<Info>
+The payloads are compiled with `-mcpu=cortex-a9 -mthumb` flags to target the MediaTek SoC's ARM Cortex-A9 cores.
+</Info>
+
+### Python Dependencies
+
+The following Python packages are required (from `requirements.txt`):
+
+```txt
+future==0.17.1
+iso8601==0.1.12
+pyserial==3.4
+pyusb==1.0.2
+PyYAML==5.1.2
+```
+
+These will be installed during the [Installation](/getting-started/installation) process.
+
+### Android Tools
+
+- **fastboot** - Required for flashing recovery images after exploit
+- **adb** (optional) - Useful for debugging and verification
+
+## Permissions and Access
+
+### USB Device Permissions (Linux)
+
+On Linux, you'll need proper permissions to access USB devices. Create a udev rule:
+
+```bash
+sudo tee /etc/udev/rules.d/51-mediatek.rules > /dev/null << 'EOF'
+# MediaTek Bootrom
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="0003", MODE="0666"
+# MediaTek Preloader
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666"
+EOF
+
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+### Disable ModemManager (Linux)
+
+<Warning>
+ModemManager can interfere with serial communication to MediaTek devices. The exploit will check for this and warn you.
+</Warning>
+
+To disable ModemManager:
+
+```bash
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+```
+
+Alternatively, you can temporarily stop it before running the exploit:
+
+```bash
+sudo systemctl stop ModemManager
+```
+
+## Verification
+
+Verify your setup has all required tools:
+
+```bash
+# Check Python version (3.6+ required)
+python3 --version
+
+# Check ARM toolchain
+arm-none-eabi-gcc --version
+arm-none-eabi-as --version
+
+# Check Android tools  
+fastboot --version
+
+# Check make
+make --version
+```
+
+All commands should return version information without errors.
+
+## Next Steps
+
+Once you have all prerequisites installed, proceed to [Installation](/getting-started/installation) to set up Kamakiri and build the exploit payloads.

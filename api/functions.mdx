@@ -1,0 +1,495 @@
+---
+title: 'Helper Functions'
+description: 'Utility functions for eMMC operations, GPT parsing, and system checks'
+---
+
+## Overview
+
+The functions module provides high-level utilities for common operations like partition switching, GPT parsing, flashing binaries, and system checks.
+
+## System Utilities
+
+### check_modemmanager()
+
+Checks if ModemManager is running and exits if found.
+
+ModemManager can interfere with serial communication to MediaTek devices. This function scans running processes and terminates the script if ModemManager is detected.
+
+**Exits:** Process with code 1 if ModemManager is running.
+
+```python
+from functions import check_modemmanager
+
+if __name__ == "__main__":
+    check_modemmanager()
+    # Safe to proceed with device communication
+```
+
+### UserInputThread
+
+Threaded input handler for non-blocking user prompts.
+
+```python
+class UserInputThread(threading.Thread):
+    def __init__(self, msg="* * * Press Enter to continue * * *", *args, **kwargs):
+        ...
+```
+
+<ParamField path="msg" type="string" optional>
+  Message to display to user. Defaults to "Press Enter to continue" message.
+</ParamField>
+
+**Attributes:**
+- `done` (bool) - Set to True when user presses Enter
+- `msg` (string) - Message displayed to user
+
+```python
+from functions import UserInputThread
+import time
+
+thread = UserInputThread(
+    msg="* * * Remove hardware short now * * *\n* * * Press Enter to continue * * *"
+)
+thread.start()
+
+while not thread.done:
+    dev.kick_watchdog()
+    time.sleep(1)
+
+log("User confirmed, continuing...")
+```
+
+## Partition Operations
+
+### switch_boot0(dev)
+
+Switches to boot0 partition and validates it.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+**Raises:** `RuntimeError` if boot0 validation fails.
+
+```python
+from functions import switch_boot0
+
+switch_boot0(dev)
+log("Now on boot0 partition")
+```
+
+### switch_boot1(dev)
+
+Switches to boot1 partition.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+```python
+from functions import switch_boot1
+
+switch_boot1(dev)
+```
+
+### switch_user(dev)
+
+Switches to user data partition and validates GPT.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+**Raises:** `RuntimeError` if GPT validation fails.
+
+```python
+from functions import switch_user
+
+switch_user(dev)
+log("Now on user partition")
+```
+
+## GPT Operations
+
+### parse_gpt(dev)
+
+Parses GPT (GUID Partition Table) and returns partition information.
+
+<ParamField path="dev" type="Device" required>
+  Device instance with user partition active.
+</ParamField>
+
+<ResponseField name="parts" type="dict[str, tuple[int, int]]">
+  Dictionary mapping partition names to (start_block, block_count) tuples.
+</ResponseField>
+
+```python
+from functions import parse_gpt, switch_user
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+
+log(f"GPT parsed: {gpt}")
+# Output: {'lk': (1024, 512), 'tee1': (1536, 512), 'boot': (2048, 16384), ...}
+
+if "boot" in gpt:
+    start_block, num_blocks = gpt["boot"]
+    log(f"Boot partition: block {start_block}, size {num_blocks * 512} bytes")
+```
+
+From `modules/main.py:44`:
+
+```python
+# Parse and validate GPT
+log("Check GPT")
+switch_user(dev)
+gpt = parse_gpt(dev)
+log(f"gpt_parsed = {gpt}")
+
+if "lk" not in gpt or "tee1" not in gpt or "boot" not in gpt or "recovery" not in gpt:
+    raise RuntimeError("bad gpt")
+```
+
+## Flash Operations
+
+### flash_data(dev, data, start_block, max_size=0)
+
+Writes data to eMMC starting at specified block.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to write to.
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Data to write (will be padded to 512-byte alignment).
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block number to write to.
+</ParamField>
+
+<ParamField path="max_size" type="int" default="0">
+  Maximum size allowed. If non-zero and data exceeds this, raises RuntimeError.
+</ParamField>
+
+**Raises:** `RuntimeError` if data exceeds max_size.
+
+```python
+from functions import flash_data
+
+data = b"bootloader_code_here" + b"\x00" * 1000
+flash_data(dev, data, start_block=0, max_size=4096)
+```
+
+### flash_binary(dev, path, start_block, max_size=0)
+
+Reads binary file and flashes it to eMMC.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to write to.
+</ParamField>
+
+<ParamField path="path" type="string" required>
+  Path to binary file to flash.
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block number to write to.
+</ParamField>
+
+<ParamField path="max_size" type="int" default="0">
+  Maximum size allowed. If non-zero and file exceeds this, raises RuntimeError.
+</ParamField>
+
+```python
+from functions import flash_binary, switch_boot0
+
+# Flash preloader to boot0
+switch_boot0(dev)
+flash_binary(dev, "../bin/preloader.img", start_block=0)
+
+# Flash LK bootloader to user partition
+switch_user(dev)
+gpt = parse_gpt(dev)
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+```
+
+From `modules/main.py:80`:
+
+```python
+# Flash TrustZone
+log("Flash tz")
+switch_user(dev)
+flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+
+# Flash LK
+log("Flash lk")
+switch_user(dev)
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+
+# Flash LK payload to boot0
+log("Flash lk-payload")
+switch_boot0(dev)
+flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+```
+
+### dump_binary(dev, path, start_block, max_size=0)
+
+Reads eMMC blocks and saves to file.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to read from.
+</ParamField>
+
+<ParamField path="path" type="string" required>
+  Output file path.
+</ParamField>
+
+<ParamField path="start_block" type="int" required>
+  Starting block number to read from.
+</ParamField>
+
+<ParamField path="max_size" type="int" default="0">
+  Number of bytes to read (must be multiple of 512).
+</ParamField>
+
+```python
+from functions import dump_binary, switch_user
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+
+# Dump boot partition
+boot_start, boot_blocks = gpt["boot"]
+dump_binary(dev, "boot_backup.img", boot_start, boot_blocks * 0x200)
+```
+
+## Boot Mode Functions
+
+### force_fastboot(dev, gpt)
+
+Writes fastboot flag to MISC partition.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from parse_gpt().
+</ParamField>
+
+```python
+from functions import force_fastboot, switch_user, parse_gpt
+
+switch_user(dev)
+gpt = parse_gpt(dev)
+force_fastboot(dev, gpt)
+log("Device will boot to fastboot on next reboot")
+```
+
+### temp_fastboot(dev, gpt)
+
+Writes temporary fastboot flag (boot-amonet).
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from parse_gpt().
+</ParamField>
+
+```python
+temp_fastboot(dev, gpt)
+```
+
+### force_recovery(dev, gpt)
+
+Writes recovery boot flag to MISC partition.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from parse_gpt().
+</ParamField>
+
+```python
+from functions import force_recovery
+
+force_recovery(dev, gpt)
+log("Device will boot to recovery on next reboot")
+```
+
+### clear_flags(dev, gpt)
+
+Clears boot mode flags in MISC partition.
+
+<ParamField path="dev" type="Device" required>
+  Device instance to operate on.
+</ParamField>
+
+<ParamField path="gpt" type="dict" required>
+  GPT dictionary from parse_gpt().
+</ParamField>
+
+```python
+from functions import clear_flags
+
+clear_flags(dev, gpt)
+log("Boot flags cleared, device will boot normally")
+```
+
+## Complete Example
+
+From `modules/main.py:22`:
+
+```python
+import sys
+import time
+from common import Device
+from logger import log
+from load_payload import load_payload, load_pl_payload
+from functions import (
+    check_modemmanager,
+    switch_user,
+    switch_boot0,
+    parse_gpt,
+    flash_binary,
+    force_fastboot,
+    UserInputThread
+)
+
+def main(dev):
+    # Load payload
+    if dev.preloader:
+        load_pl_payload(dev)
+    else:
+        load_payload(dev)
+
+    # Verify device type
+    device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+    log(f"Device type: {device_type_id}")
+
+    # Parse GPT
+    log("Check GPT")
+    switch_user(dev)
+    gpt = parse_gpt(dev)
+    log(f"gpt_parsed = {gpt}")
+
+    if "lk" not in gpt or "tee1" not in gpt:
+        raise RuntimeError("bad gpt")
+
+    # Check RPMB
+    log("Check rpmb")
+    rpmb = dev.rpmb_read()
+    if rpmb[0:4] != b"AMZN":
+        thread = UserInputThread(
+            msg="rpmb looks broken; press enter to continue or Ctrl+C to abort"
+        )
+        thread.start()
+        while not thread.done:
+            dev.kick_watchdog()
+            time.sleep(1)
+
+    # Zero out RPMB to enable downgrade
+    log("Downgrade rpmb")
+    dev.rpmb_write(b"\x00" * 0x100)
+
+    # Flash bootloader components
+    log("Flash tz")
+    switch_user(dev)
+    flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+
+    log("Flash lk")
+    switch_user(dev)
+    flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+
+    log("Flash lk-payload")
+    switch_boot0(dev)
+    flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+
+    log("Flash preloader")
+    switch_boot0(dev)
+    flash_binary(dev, "../bin/preloader.img", 0)
+
+    # Set fastboot mode and reboot
+    log("Force fastboot")
+    force_fastboot(dev, gpt)
+
+    time.sleep(5)  # Wait for data to flush
+
+    log("Reboot")
+    dev.reboot()
+
+if __name__ == "__main__":
+    check_modemmanager()
+
+    dev = Device()
+    dev.find_device()
+
+    main(dev)
+```
+
+## Internal Implementation Details
+
+### switch_boot0 Validation
+
+From `modules/functions.py:36`:
+
+```python
+def switch_boot0(dev):
+    dev.emmc_switch(1)
+    block = dev.emmc_read(0)
+    if block[0:9] != b"EMMC_BOOT" and block != b"\x00" * 0x200:
+        dev.reboot()
+        raise RuntimeError("what's wrong with your BOOT0?")
+    dev.kick_watchdog()
+```
+
+### GPT Parsing Algorithm
+
+From `modules/functions.py:117`:
+
+```python
+def parse_gpt(dev):
+    # Read GPT header and partition entries
+    data = (dev.emmc_read(0x400 // 0x200) + 
+            dev.emmc_read(0x600 // 0x200) + 
+            dev.emmc_read(0x800 // 0x200) + 
+            dev.emmc_read(0xA00 // 0x200))
+    
+    num = len(data) // 0x80
+    parts = dict()
+    
+    for x in range(num):
+        part = data[x * 0x80:(x + 1) * 0x80]
+        part_name = part[0x38:].decode("utf-16le").rstrip("\x00")
+        part_start = struct.unpack("<Q", part[0x20:0x28])[0]
+        part_end = struct.unpack("<Q", part[0x28:0x30])[0]
+        parts[part_name] = (part_start, part_end - part_start + 1)
+    
+    return parts
+```
+
+### Flash Progress Display
+
+From `modules/functions.py:48`:
+
+```python
+def flash_data(dev, data, start_block, max_size=0):
+    while len(data) % 0x200 != 0:
+        data += b"\x00"
+
+    if max_size and len(data) > max_size:
+        raise RuntimeError("data too big to flash")
+
+    blocks = len(data) // 0x200
+    for x in range(blocks):
+        print(f"[{x + 1} / {blocks}]", end='\r')
+        dev.emmc_write(start_block + x, data[x * 0x200:(x + 1) * 0x200])
+        if x % 10 == 0:
+            dev.kick_watchdog()
+    print("")
+```

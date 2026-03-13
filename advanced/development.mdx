@@ -1,0 +1,620 @@
+---
+title: 'Development'
+description: 'Contributing to Kamakiri, testing changes, and adding device support'
+---
+
+## Contributing to Kamakiri
+
+Kamakiri is an open-source bootrom exploitation framework. Contributions are welcome for bug fixes, new features, and device support.
+
+### Getting Started
+
+<Steps>
+  <Step title="Fork Repository">
+    Fork the Kamakiri repository on GitHub.
+  </Step>
+  
+  <Step title="Clone Your Fork">
+    ```bash
+    git clone https://github.com/YOUR_USERNAME/kamakiri.git
+    cd kamakiri
+    ```
+  </Step>
+  
+  <Step title="Set Up Environment">
+    Install development dependencies:
+    
+    ```bash
+    # ARM toolchain
+    sudo apt-get install gcc-arm-none-eabi binutils-arm-none-eabi
+    
+    # Python dependencies
+    pip3 install pyserial pyusb
+    ```
+  </Step>
+  
+  <Step title="Create Feature Branch">
+    ```bash
+    git checkout -b feature/your-feature-name
+    ```
+  </Step>
+</Steps>
+
+### Code Organization
+
+Kamakiri consists of three main components:
+
+```
+kamakiri/
+├── brom-payload/       # ARM bootrom payloads (C)
+├── lk-payload/         # LK bootloader payload (C)
+├── microloader/        # Boot microloader (C)
+└── modules/            # Exploit orchestration (Python)
+```
+
+#### ARM Payloads (`brom-payload/`)
+
+**Core Files:**
+- `stage1.c` - Initial bootrom payload (< 2560 bytes)
+- `stage2.c` - Advanced payload with MMC/RPMB support
+- `pl.c` - Preloader mode payload
+- `brom_common.c` - Bootrom protocol primitives
+- `payload_common.c` - Shared payload infrastructure
+
+**Drivers:**
+- `drivers/mmc.c` - MMC initialization and protocol
+- `drivers/sd.c` - SD/eMMC block operations
+
+**Crypto:**
+- `crypto/sha256.c` - SHA-256 implementation
+- `crypto/hmac-sha256.c` - HMAC-SHA256 for RPMB
+
+**Build System:**
+- `Makefile` - Multi-stage build system
+- `*.ld` - Linker scripts for memory layout
+
+#### Python Modules (`modules/`)
+
+**Core Files:**
+- `main.py` - Main exploit orchestration
+- `common.py` - Device class and serial protocol
+- `load_payload.py` - Payload loading logic
+- `functions.py` - Helper functions (GPT, flashing, etc.)
+- `logger.py` - Logging utilities
+
+#### Build Scripts
+
+- `makedist.sh` - Distribution packaging
+- `bootrom-step.sh` - Bootrom exploitation step
+- `fastboot-step.sh` - Fastboot unlock step
+
+## Development Workflow
+
+### Modifying ARM Payloads
+
+<Steps>
+  <Step title="Edit Source">
+    Modify C source files in `brom-payload/`, `lk-payload/`, or `microloader/`.
+  </Step>
+  
+  <Step title="Build Payloads">
+    ```bash
+    cd brom-payload
+    make clean
+    make
+    ```
+    
+    Verify build output:
+    ```bash
+    ls -lh stage1/stage1.bin stage2/stage2.bin pl/pl.bin
+    ```
+  </Step>
+  
+  <Step title="Test Changes">
+    See [Testing Payloads](#testing-payloads) below.
+  </Step>
+  
+  <Step title="Commit Changes">
+    ```bash
+    git add brom-payload/
+    git commit -m "payload: describe your changes"
+    ```
+  </Step>
+</Steps>
+
+### Modifying Python Modules
+
+<Steps>
+  <Step title="Edit Module">
+    Modify Python files in `modules/`.
+  </Step>
+  
+  <Step title="Test Changes">
+    ```bash
+    python3 modules/main.py
+    # Or specific module:
+    python3 modules/load_payload.py /dev/ttyUSB0
+    ```
+  </Step>
+  
+  <Step title="Commit Changes">
+    ```bash
+    git add modules/
+    git commit -m "modules: describe your changes"
+    ```
+  </Step>
+</Steps>
+
+## Testing Changes
+
+### Testing Payloads
+
+<Warning>
+**Use Test Device Only:** Always test on a dedicated device. Bootrom exploits can cause permanent damage if buggy.
+</Warning>
+
+#### Safe Testing Procedure
+
+<Steps>
+  <Step title="Backup Device">
+    Before testing, ensure you can restore device to factory state.
+  </Step>
+  
+  <Step title="Build Modified Payloads">
+    ```bash
+    cd brom-payload
+    make clean
+    make
+    ```
+  </Step>
+  
+  <Step title="Verify Payload Size">
+    Stage 1 must be ≤ 2560 bytes:
+    ```bash
+    ls -l stage1/stage1.bin
+    # Must show size ≤ 2560
+    ```
+  </Step>
+  
+  <Step title="Test Stage 1 Loading">
+    ```bash
+    python3 modules/load_payload.py /dev/ttyUSB0
+    ```
+    
+    Expected output:
+    ```
+    Handshake
+    Disable watchdog
+    Let's rock
+    Waiting for stage 1 to come online...
+    All good
+    ```
+  </Step>
+  
+  <Step title="Test Full Exploit">
+    ```bash
+    python3 modules/main.py
+    ```
+    
+    Monitor for errors and verify device reboots successfully.
+  </Step>
+</Steps>
+
+### Testing Strategy
+
+**Incremental Testing:**
+1. Test stage 1 loading first
+2. Test stage 2 loading
+3. Test individual commands (read/write)
+4. Test full exploit workflow
+
+**Validation Checks:**
+- Payload size constraints
+- Serial protocol handshake
+- Memory access operations
+- RPMB read/write operations
+- Device reboot/recovery
+
+### Debug Output
+
+Add debug strings to payloads:
+
+```c
+// stage1.c
+print("Debug: checkpoint reached\n");
+
+// stage2.c
+printf("Debug: value = 0x%08X\n", some_value);
+```
+
+Monitor output via serial console.
+
+## Adding Device Support
+
+### Prerequisites
+
+<Warning>
+**Extreme Caution:** Adding device support requires deep understanding of MediaTek bootrom. Incorrect memory addresses can permanently brick devices.
+</Warning>
+
+**Required Knowledge:**
+- MediaTek SoC architecture (MT817x series)
+- ARM Cortex-A9 memory layout
+- eMMC partition structure
+- Bootrom USB protocol
+
+### Device Information Needed
+
+<Steps>
+  <Step title="SoC Identification">
+    Identify MediaTek SoC model:
+    - MT8173 (Cortex-A72 + Cortex-A53)
+    - MT8176 (Cortex-A72 + Cortex-A53)
+    - Other MT817x variants
+  </Step>
+  
+  <Step title="Memory Map">
+    Determine memory layout:
+    - Bootrom address range
+    - SRAM address range
+    - MMIO peripheral base addresses
+    - Watchdog timer registers
+  </Step>
+  
+  <Step title="Partition Layout">
+    Extract GPT partition table:
+    ```bash
+    # After exploit loads
+    python3 -c "from modules.functions import *; \
+                from modules.common import Device; \
+                dev = Device('/dev/ttyUSB0'); \
+                print(parse_gpt(dev))"
+    ```
+  </Step>
+  
+  <Step title="Device Type ID">
+    Read device identifier from IDME:
+    ```python
+    device_type_id = dev.idme_read(b"device_type_id")
+    print(device_type_id.decode('utf-8'))
+    ```
+  </Step>
+</Steps>
+
+### Modification Checklist
+
+#### 1. Update Device Detection
+
+File: `modules/main.py:29-36`
+
+```python
+device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+
+log("Check device_type_id")
+if device_type_id == "YOUR_DEVICE_TYPE":
+    log("Detected YOUR_DEVICE (" + device_type_id + ")")
+else:
+    log("Wrong device detected: " + device_type_id)
+    exit(1)
+```
+
+#### 2. Add GPT Binary
+
+Create GPT binary for device:
+
+File: `bin/gpt-YOUR_DEVICE.bin`
+
+Extract from working device:
+```bash
+# First 34 sectors (17 KB)
+dd if=/dev/block/mmcblk0 of=gpt-YOUR_DEVICE.bin bs=512 count=34
+```
+
+#### 3. Update Memory Addresses
+
+File: `modules/common.py:17`
+
+```python
+# Verify crypto base for your SoC
+CRYPTO_BASE = 0x10210000  # May differ per SoC
+```
+
+File: `brom-payload/stage1.c:59-62`
+
+```c
+// Verify watchdog base address
+volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+```
+
+#### 4. Verify Linker Addresses
+
+File: `brom-payload/stage1.ld:8`
+
+```ld
+. = 0x100a00;  // Verify bootrom DMA buffer address
+```
+
+File: `brom-payload/stage2.ld:8`
+
+```ld
+. = 0x201000;  // Verify SRAM address
+```
+
+#### 5. Update Distribution Script
+
+File: `makedist.sh`
+
+Add device-specific GPT:
+```bash
+cp bin/gpt-YOUR_DEVICE.bin dist/gptfix/kamakiri/bin/
+```
+
+### Testing New Device Support
+
+<Steps>
+  <Step title="Test Bootrom Entry">
+    Verify device enters bootrom mode and responds to handshake.
+  </Step>
+  
+  <Step title="Test Memory Access">
+    Verify read32/write32 operations work correctly.
+  </Step>
+  
+  <Step title="Test Payload Loading">
+    Verify stage 1 and stage 2 load successfully.
+  </Step>
+  
+  <Step title="Test eMMC Operations">
+    Verify eMMC read/write operations.
+  </Step>
+  
+  <Step title="Test RPMB Access">
+    Verify RPMB read/write operations.
+  </Step>
+  
+  <Step title="Test Full Exploit">
+    Run complete exploit and verify bootloader unlock.
+  </Step>
+</Steps>
+
+## Code Style Guidelines
+
+### C Code Style
+
+```c
+// Function naming: lowercase with underscores
+void send_usb_response(int a, int b, int c);
+
+// Variable naming: lowercase with underscores
+uint32_t magic_value = 0xf00dd00d;
+
+// Constants: uppercase with underscores
+#define WATCHDOG_BASE 0x10007000
+
+// Structs: lowercase with underscores
+struct msdc_host {
+    uint32_t ocr_avail;
+};
+
+// Comments: explain why, not what
+// Disable watchdog to prevent reboot during long operations
+dev.write32(0x10007000, 0x22000000);
+```
+
+### Python Code Style
+
+```python
+# Follow PEP 8
+# Function naming: lowercase with underscores
+def parse_gpt(dev):
+    pass
+
+# Class naming: PascalCase
+class Device:
+    pass
+
+# Constants: uppercase with underscores
+BAUD = 115200
+TIMEOUT = 5
+
+# Use descriptive names
+device_type_id = dev.idme_read(b"device_type_id")
+
+# Comments: explain complex logic
+# RPMB must be zeroed to enable TrustZone downgrade
+dev.rpmb_write(b"\x00" * 0x100)
+```
+
+### Commit Message Format
+
+```
+component: brief description
+
+Longer explanation if needed. Wrap at 72 characters.
+
+- Bullet points for multiple changes
+- Reference issue numbers: Fixes #123
+```
+
+**Examples:**
+
+```
+payload: reduce stage1 size by removing debug strings
+
+Stage1 was exceeding 2560 byte limit on some toolchain versions.
+Removed verbose debug output and optimized string literals.
+```
+
+```
+modules: add support for MT8176 devices
+
+- Update device detection for new device_type_id
+- Add MT8176-specific memory addresses
+- Include GPT binary for MT8176 variant
+
+Fixes #45
+```
+
+## Submitting Changes
+
+<Steps>
+  <Step title="Test Thoroughly">
+    Verify changes work on actual hardware.
+  </Step>
+  
+  <Step title="Update Documentation">
+    Document new features or device support.
+  </Step>
+  
+  <Step title="Create Pull Request">
+    ```bash
+    git push origin feature/your-feature-name
+    ```
+    
+    Open pull request on GitHub with:
+    - Clear description of changes
+    - Testing results
+    - Device compatibility notes
+  </Step>
+  
+  <Step title="Address Review Comments">
+    Respond to maintainer feedback and make requested changes.
+  </Step>
+</Steps>
+
+## Development Resources
+
+### MediaTek Documentation
+
+<Card title="MediaTek SoC Datasheets" icon="microchip">
+  Look for MT817x series datasheets (may require NDA):
+  - Memory map
+  - Register definitions
+  - Boot sequence
+</Card>
+
+### ARM Documentation
+
+<CardGroup cols={2}>
+  <Card title="Cortex-A9 TRM" icon="book" href="https://developer.arm.com/documentation/ddi0388/latest/">
+    Technical Reference Manual for Cortex-A9
+  </Card>
+  <Card title="ARM Architecture" icon="microchip" href="https://developer.arm.com/architectures/cpu-architecture/a-profile">
+    ARMv7-A architecture documentation
+  </Card>
+</CardGroup>
+
+### Related Projects
+
+<CardGroup cols={2}>
+  <Card title="MTK Bypass" icon="github">
+    MediaTek bootrom exploitation research
+  </Card>
+  <Card title="Amonet" icon="github">
+    Amazon Fire tablet exploit (predecessor to Kamakiri)
+  </Card>
+</CardGroup>
+
+## Security Considerations
+
+<Warning>
+**Responsible Disclosure:** If you discover new vulnerabilities in MediaTek bootrom, practice responsible disclosure:
+
+1. Report to MediaTek security team first
+2. Allow 90 days for patch development
+3. Coordinate public disclosure
+</Warning>
+
+### Bootrom Vulnerabilities
+
+Kamakiri exploits several bootrom weaknesses:
+
+1. **USB Stack Vulnerability** - Buffer overflow in USB control transfer handler
+2. **DMA Buffer Overflow** - Insufficient bounds checking on download agent size
+3. **Memory Protection Bypass** - Ability to write to protected memory regions
+
+**Files showing exploitation:**
+- `modules/load_payload.py:86-89` - USB control transfer exploit
+- `modules/load_payload.py:27-38` - DMA buffer overflow setup
+
+### Safe Development Practices
+
+1. **Always use test devices** - Never test on primary device
+2. **Backup before testing** - Maintain ability to restore
+3. **Validate bounds** - Check all array/buffer accesses
+4. **Handle errors gracefully** - Don't leave device in bad state
+5. **Document assumptions** - Note hardware dependencies
+
+## Debugging Tools
+
+### Serial Console Monitor
+
+Create simple monitor script:
+
+```python
+#!/usr/bin/env python3
+import serial
+import sys
+
+ser = serial.Serial(sys.argv[1], 115200, timeout=1)
+while True:
+    data = ser.read(1)
+    if data:
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
+```
+
+Usage:
+```bash
+python3 monitor.py /dev/ttyUSB0
+```
+
+### Binary Analysis Tools
+
+```bash
+# Disassemble with annotations
+arm-none-eabi-objdump -d -S stage1/stage1.elf > stage1.asm
+
+# View symbol sizes
+arm-none-eabi-nm -S --size-sort stage1/stage1.elf
+
+# Check dependencies
+arm-none-eabi-objdump -p stage1/stage1.elf
+
+# View all strings
+arm-none-eabi-strings stage1/stage1.bin
+```
+
+### Memory Dump Analysis
+
+Dump memory regions for analysis:
+
+```python
+# In Python shell after payload loads
+from modules.common import Device
+dev = Device('/dev/ttyUSB0')
+
+# Dump bootrom
+bootrom = dev.mem_read(0x0, 0x10000)
+with open('bootrom.bin', 'wb') as f:
+    f.write(bootrom)
+
+# Analyze with hexdump or Ghidra
+```
+
+## Getting Help
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/amonet-kamakiri/kamakiri/issues">
+    Ask questions and report bugs
+  </Card>
+  <Card title="Troubleshooting Guide" icon="wrench" href="/advanced/troubleshooting">
+    Debug common issues
+  </Card>
+</CardGroup>
+
+## License
+
+Kamakiri is released under the MIT License. All contributions must be compatible with MIT licensing.
+
+See: `LICENSE` file in repository root.

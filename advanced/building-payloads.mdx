@@ -1,0 +1,380 @@
+---
+title: 'Building ARM Payloads'
+description: 'Cross-compilation setup and build system for Kamakiri bootrom payloads'
+---
+
+## Overview
+
+Kamakiri uses custom ARM Thumb-2 payloads compiled for Cortex-A9 to exploit MediaTek bootrom vulnerabilities. The build system requires the ARM bare-metal toolchain and produces position-independent binaries.
+
+## Toolchain Requirements
+
+### Required Tools
+
+All payloads require the ARM GNU Embedded Toolchain:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install gcc-arm-none-eabi binutils-arm-none-eabi
+
+# Arch Linux
+sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
+
+# macOS
+brew install --cask gcc-arm-embedded
+```
+
+Verify installation:
+
+```bash
+arm-none-eabi-gcc --version
+arm-none-eabi-as --version
+arm-none-eabi-objcopy --version
+```
+
+### Toolchain Components
+
+The build system uses these tools from the ARM toolchain:
+
+- **arm-none-eabi-gcc** - C compiler and linker
+- **arm-none-eabi-as** - Assembler for `.S` files
+- **arm-none-eabi-objcopy** - ELF to binary conversion
+
+## Build System Architecture
+
+### Three-Stage Payload System
+
+Kamakiri uses a three-stage exploitation process:
+
+1. **Stage 1** (`stage1.bin`) - Initial bootrom payload loaded at `0x100a00`
+2. **Stage 2** (`stage2.bin`) - Advanced features loaded at `0x201000`
+3. **PL** (`pl.bin`) - Preloader payload loaded at `0x40001000`
+
+Each stage has its own Makefile target and linker script.
+
+### Compilation Flags
+
+#### CFLAGS (All Payloads)
+
+```makefile
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access \
+          -Wall -Wextra
+```
+
+**Flag Breakdown:**
+
+- `-std=gnu99` - GNU C99 standard with extensions
+- `-Os` - Optimize for size (critical for bootrom constraints)
+- `-mthumb` - Generate Thumb-2 instructions
+- `-mcpu=cortex-a9` - Target Cortex-A9 architecture
+- `-fno-builtin-printf` - Use custom printf implementation
+- `-fno-strict-aliasing` - Allow flexible pointer casting
+- `-fno-builtin-memcpy` - Use custom memory operations
+- `-mno-unaligned-access` - Prevent unaligned memory access
+
+#### LDFLAGS
+
+```makefile
+LDFLAGS := -nodefaultlibs -nostdlib -lgcc
+```
+
+**Flag Breakdown:**
+
+- `-nodefaultlibs` - Don't link standard system libraries
+- `-nostdlib` - Don't use standard library startup files
+- `-lgcc` - Link only GCC runtime library (for division, etc.)
+
+### LK and Microloader Payloads
+
+The LK payload and microloader use slightly different flags:
+
+```makefile
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access \
+          -DPRINTF_DISABLE_SUPPORT_FLOAT=1
+
+LDFLAGS := -T linker.x -nodefaultlibs -nostdlib
+```
+
+**Additional Details:**
+
+- `-DPRINTF_DISABLE_SUPPORT_FLOAT=1` - Disable float support to reduce size
+- LK payload appends 512-byte padding: `dd if=/dev/zero bs=512 count=1 >>payload.bin`
+
+## Building Payloads
+
+### Build All Payloads
+
+```bash
+cd brom-payload
+make clean
+make
+```
+
+This produces:
+- `stage1/stage1.bin`
+- `stage2/stage2.bin`
+- `pl/pl.bin`
+
+### Build Individual Stages
+
+```bash
+# Stage 1 only
+make stage1/stage1.bin
+
+# Stage 2 only
+make stage2/stage2.bin
+
+# Preloader payload only
+make pl/pl.bin
+```
+
+### Build LK Payload
+
+```bash
+cd lk-payload
+make clean
+make
+```
+
+Produces: `build/payload.bin` (with 512-byte padding)
+
+### Build Microloader
+
+```bash
+cd microloader
+make clean
+make
+```
+
+Produces: `build/payload.bin`
+
+## Linker Scripts
+
+### Stage 1 Linker Script
+
+File: `brom-payload/stage1.ld`
+
+```ld
+OUTPUT_FORMAT("elf32-littlearm", "elf32-bigarm", "elf32-littlearm")
+OUTPUT_ARCH(arm)
+
+ENTRY(start)
+
+SECTIONS
+{
+  . = 0x100a00;
+
+  .text     : { *(.text.start) *(.text   .text.*   .gnu.linkonce.t.*) }
+  .rodata   : { *(.rodata .rodata.* .gnu.linkonce.r.*) }
+  .data     : { *(.data   .data.*   .gnu.linkonce.d.*) }
+  .bss      : { *(.bss    .bss.*    .gnu.linkonce.b.*) *(COMMON) }
+  /DISCARD/ : { *(.interp) *(.dynsym) *(.dynstr) *(.hash) *(.dynamic) *(.comment) }
+}
+```
+
+**Critical Details:**
+
+- Entry point: `0x100a00` (bootrom-controlled memory region)
+- Must be < 2560 bytes (`0xA00`) to fit in bootrom buffer
+- `.text.start` section must contain entry code
+
+### Stage 2 Linker Script
+
+File: `brom-payload/stage2.ld`
+
+```ld
+SECTIONS
+{
+  . = 0x201000;
+  ...
+}
+```
+
+**Details:**
+
+- Entry point: `0x201000` (SRAM region)
+- No size constraints (loaded by stage1)
+- Includes MMC/SD drivers and crypto libraries
+
+### Preloader Linker Script
+
+File: `brom-payload/pl.ld`
+
+- Entry point: `0x40001000` (preloader execution context)
+- Used when device boots into preloader mode
+
+## Source File Organization
+
+### Stage 1 Sources
+
+File: `brom-payload/Makefile:13`
+
+```makefile
+STAGE1_SRC = stage1.c brom_common.c common.c
+```
+
+**Components:**
+
+- `stage1.c` - Main command loop, USB response handling
+- `brom_common.c` - Bootrom-specific primitives
+- `common.c` - Shared utilities
+- `start.S` - Assembly entry point
+
+### Stage 2 Sources
+
+File: `brom-payload/Makefile:14`
+
+```makefile
+STAGE2_SRC = stage2.c brom_common.c common.c payload_common.c \
+             libc.c printf.c drivers/sd.c drivers/mmc.c \
+             crypto/sha256.c crypto/hmac-sha256.c
+```
+
+**Components:**
+
+- MMC/SD drivers for eMMC access
+- SHA256 and HMAC-SHA256 for RPMB operations
+- Full printf implementation
+- Complete libc subset
+
+## Creating a Distribution Package
+
+The `makedist.sh` script packages all built payloads:
+
+```bash
+./makedist.sh
+```
+
+This creates `dist/` directory structure with:
+
+```
+dist/unlock/kamakiri/
+├── brom-payload/
+│   ├── stage1/stage1.bin
+│   ├── stage2/stage2.bin
+│   └── pl/pl.bin
+├── lk-payload/build/payload.bin
+├── microloader.bin
+└── modules/ (Python exploit scripts)
+```
+
+## Payload Size Constraints
+
+<Warning>
+**Stage 1 Critical Constraint:** Stage 1 payload must be ≤ 2560 bytes (0xA00). Exceeding this causes bootrom buffer overflow.
+</Warning>
+
+**Verify payload size:**
+
+```bash
+ls -l brom-payload/stage1/stage1.bin
+# Must be ≤ 2560 bytes
+```
+
+**If payload is too large:**
+
+1. Remove debug strings from `stage1.c`
+2. Verify `-Os` optimization is enabled
+3. Move functionality to stage 2
+4. Check for unused code in linked objects
+
+## Custom Memory Operations
+
+### Why Custom libc?
+
+Standard library functions are disabled because:
+
+1. No operating system or runtime environment
+2. Need precise control over memory operations
+3. Bootrom execution constraints
+4. Size optimization requirements
+
+### Implemented Functions
+
+See: `brom-payload/libc.c` and `brom-payload/printf.c`
+
+**Available functions:**
+
+- `memcpy`, `memset`, `memmove`
+- `strlen`, `strcmp`, `strncmp`
+- `printf`, `sprintf` (limited format support)
+
+## Development Workflow
+
+### 1. Modify Source Code
+
+Edit files in `brom-payload/`, `lk-payload/`, or `microloader/`
+
+### 2. Clean Build
+
+```bash
+make clean
+make
+```
+
+### 3. Test Changes
+
+See [Testing Changes](/advanced/development#testing-payloads) for testing procedures.
+
+### 4. Verify Binary Output
+
+```bash
+# Check ELF sections
+arm-none-eabi-objdump -h stage1/stage1.elf
+
+# Disassemble
+arm-none-eabi-objdump -d stage1/stage1.elf
+
+# Check binary size
+ls -lh stage1/stage1.bin
+```
+
+## Advanced Techniques
+
+### Position-Independent Code
+
+Payloads should avoid absolute addressing:
+
+```c
+// Bad: absolute address
+void *ptr = (void *)0x12345678;
+
+// Good: relative or passed address
+void *ptr = &some_variable;
+```
+
+### Watchdog Management
+
+Critical operations must kick watchdog timer:
+
+```c
+volatile uint32_t *wdt = (volatile uint32_t *)0x10007000;
+wdt[8/4] = 0x1971;  // Kick watchdog
+```
+
+See: `brom-payload/stage1.c:69-72`
+
+### Memory-Mapped I/O
+
+Direct hardware access via MMIO:
+
+```c
+// Watchdog registers at 0x10007000
+volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+reg[0] = 0x22000014;  // Configure watchdog
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Debug build errors and payload issues
+  </Card>
+  <Card title="Contributing" icon="code-branch" href="/advanced/development">
+    Contribute to Kamakiri development
+  </Card>
+</CardGroup>

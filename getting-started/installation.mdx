@@ -1,0 +1,344 @@
+---
+title: Installation
+description: Install dependencies, build payloads, and set up the Kamakiri exploit environment
+---
+
+## Clone the Repository
+
+First, clone the Kamakiri repository from GitHub:
+
+```bash
+git clone https://github.com/amonet-kamakiri/kamakiri.git
+cd kamakiri
+```
+
+## Install Python Dependencies
+
+Install the required Python packages using pip:
+
+<CodeGroup>
+
+```bash System-wide Installation
+pip3 install -r requirements.txt
+```
+
+```bash Virtual Environment (Recommended)
+# Create a virtual environment
+python3 -m venv venv
+
+# Activate it
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+```bash User Installation
+pip3 install --user -r requirements.txt
+```
+
+</CodeGroup>
+
+The `requirements.txt` file contains:
+
+- **pyserial** (3.4) - Serial port communication with device bootrom
+- **pyusb** (1.0.2) - USB device access
+- **PyYAML** (5.1.2) - Configuration file parsing
+- **future** (0.17.1) - Python 2/3 compatibility layer
+- **iso8601** (0.1.12) - Date/time parsing
+
+<Note>
+If you encounter permission errors during installation, use the virtual environment method or `--user` flag to install packages without root access.
+</Note>
+
+## Build ARM Payloads
+
+Kamakiri uses three custom ARM payloads that run in the device's bootrom:
+
+- **stage1** - Initial payload injected via bootrom exploit
+- **stage2** - Extended payload with eMMC access
+- **pl** - Preloader-compatible payload
+
+### Build Bootrom Payloads
+
+<Steps>
+
+<Step title="Navigate to payload directory">
+
+```bash
+cd brom-payload
+```
+
+</Step>
+
+<Step title="Compile the payloads">
+
+```bash
+make
+```
+
+This will compile three ARM binaries using the ARM Embedded GCC toolchain:
+
+```
+stage1/stage1.bin
+stage2/stage2.bin
+pl/pl.bin
+```
+
+</Step>
+
+<Step title="Verify build output">
+
+```bash
+ls -lh stage1/stage1.bin stage2/stage2.bin pl/pl.bin
+```
+
+Expected output:
+
+```
+-rw-r--r-- 1 user user  2.1K stage1/stage1.bin
+-rw-r--r-- 1 user user   15K stage2/stage2.bin
+-rw-r--r-- 1 user user   14K pl/pl.bin
+```
+
+</Step>
+
+<Step title="Return to root directory">
+
+```bash
+cd ..
+```
+
+</Step>
+
+</Steps>
+
+### Build LK Payload
+
+The LK (Little Kernel) payload patches the bootloader to enable fastboot mode:
+
+<Steps>
+
+<Step title="Navigate to lk-payload directory">
+
+```bash
+cd lk-payload
+```
+
+</Step>
+
+<Step title="Compile the LK payload">
+
+```bash
+make
+```
+
+This creates `build/payload.bin` (padded to 512 bytes).
+
+</Step>
+
+<Step title="Verify build output">
+
+```bash
+ls -lh build/payload.bin
+```
+
+Expected output:
+
+```
+-rw-r--r-- 1 user user  512 build/payload.bin
+```
+
+</Step>
+
+<Step title="Return to root directory">
+
+```bash
+cd ..
+```
+
+</Step>
+
+</Steps>
+
+### Understanding the Build Process
+
+The Makefile compiles ARM code with specific flags:
+
+```makefile
+CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+          -fno-builtin-printf -fno-strict-aliasing \
+          -fno-builtin-memcpy -mno-unaligned-access
+```
+
+- **`-mcpu=cortex-a9`** - Target MediaTek's ARM Cortex-A9 cores
+- **`-mthumb`** - Use Thumb instruction set for smaller code
+- **`-Os`** - Optimize for size (critical for bootrom constraints)
+- **`-fno-builtin-memcpy`** - Custom memory operations
+
+<Info>
+The payloads must fit within bootrom memory constraints. Stage1 is especially size-critical as it runs in limited SRAM.
+</Info>
+
+## Obtain Binary Files
+
+Kamakiri requires several binary files from the target device's firmware:
+
+```
+bin/
+├── gpt-mantis.bin      # GPT partition table
+├── lk.bin              # Little Kernel bootloader (vulnerable version)
+├── tz.img              # TrustZone image (vulnerable version)
+├── preloader.img       # Preloader (modified for persistence)
+├── microloader.bin     # Boot hijacker
+└── twrp.img            # TWRP recovery image
+```
+
+<Warning>
+These binary files are device-specific and must match your hardware. Using incorrect binaries WILL brick your device. These files are typically extracted from stock firmware or provided by the device community.
+</Warning>
+
+### Creating the bin Directory
+
+Create the directory structure:
+
+```bash
+mkdir -p bin
+```
+
+You'll need to obtain these files from:
+
+1. **Stock firmware dumps** - Extract from official OTA updates
+2. **Device community forums** - XDA Developers, device-specific communities
+3. **Existing exploits** - Other users who have successfully exploited the same device
+
+<Note>
+The specific process for obtaining these files varies by device. Consult your device's community for guidance.
+</Note>
+
+## Verify Installation
+
+Confirm all components are built and ready:
+
+```bash
+# Check Python modules can be imported
+python3 -c "import serial; import usb.core; import yaml; print('Python deps OK')"
+
+# Check bootrom payloads exist
+test -f brom-payload/stage1/stage1.bin && \
+test -f brom-payload/stage2/stage2.bin && \
+test -f brom-payload/pl/pl.bin && \
+echo "Bootrom payloads OK"
+
+# Check LK payload exists  
+test -f lk-payload/build/payload.bin && \
+echo "LK payload OK"
+
+# Check shell scripts are executable
+test -x bootrom-step.sh && \
+test -x fastboot-step.sh && \
+echo "Scripts OK"
+```
+
+All checks should print "OK" messages.
+
+## Troubleshooting
+
+### Build Errors
+
+<AccordionGroup>
+
+<Accordion title="arm-none-eabi-gcc: command not found">
+
+The ARM toolchain is not installed or not in PATH.
+
+**Solution:**
+
+```bash
+# Debian/Ubuntu
+sudo apt install gcc-arm-none-eabi
+
+# macOS
+brew install arm-none-eabi-gcc
+```
+
+Verify installation:
+
+```bash
+arm-none-eabi-gcc --version
+```
+
+</Accordion>
+
+<Accordion title="ModuleNotFoundError: No module named 'serial'">
+
+Python dependencies are not installed.
+
+**Solution:**
+
+```bash
+pip3 install -r requirements.txt
+```
+
+If using a virtual environment, ensure it's activated:
+
+```bash
+source venv/bin/activate
+```
+
+</Accordion>
+
+<Accordion title="make: *** [stage1.bin] Error 1">
+
+Compilation failed due to toolchain issues or missing dependencies.
+
+**Solution:**
+
+1. Check ARM toolchain version compatibility:
+   ```bash
+   arm-none-eabi-gcc --version
+   ```
+
+2. Clean and rebuild:
+   ```bash
+   make clean
+   make
+   ```
+
+3. Check for specific error messages in the build output.
+
+</Accordion>
+
+<Accordion title="Permission denied when running scripts">
+
+Shell scripts are not executable.
+
+**Solution:**
+
+```bash
+chmod +x bootrom-step.sh fastboot-step.sh gpt-fix.sh
+```
+
+</Accordion>
+
+</AccordionGroup>
+
+### USB Access Issues
+
+If you encounter USB permission errors:
+
+```bash
+# Add udev rules (Linux)
+sudo tee /etc/udev/rules.d/51-mediatek.rules > /dev/null << 'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666"
+EOF
+
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Disconnect and reconnect your device.
+
+## Next Steps
+
+With Kamakiri installed and payloads built, you're ready to run the exploit. Proceed to the [Quickstart Guide](/getting-started/quickstart) for step-by-step instructions.

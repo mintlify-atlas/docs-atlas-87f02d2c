@@ -1,0 +1,498 @@
+---
+title: Supported Devices
+description: Device compatibility, chipset details, and device_type_id verification
+---
+
+## Overview
+
+Kamakiri targets MediaTek-based devices with specific bootrom versions that contain the exploitable vulnerability. The exploit has been tested and confirmed working on Amazon Fire tablet devices using MT8163 and MT8173 chipsets.
+
+## Chipset Compatibility
+
+### MediaTek MT8163
+
+**Architecture:** ARM Cortex-A53 quad-core
+
+**Vulnerable BootROM:** Yes
+
+**BROM Version:** Version with USB control transfer vulnerability
+
+**Key Characteristics:**
+- 64-bit ARMv8-A architecture
+- BootROM address space: `0x00000000 - 0x0001FFFF`
+- Internal SRAM: `0x00200000` (128KB)
+- Watchdog base: `0x10007000`
+- UART0 base: `0x11003000`
+- Crypto engine: `0x10210000`
+
+### MediaTek MT8173
+
+**Architecture:** ARM Cortex-A72/A53 big.LITTLE
+
+**Vulnerable BootROM:** Yes (same vulnerability as MT8163)
+
+**BROM Version:** Shares code with MT8163
+
+**Key Characteristics:**
+- Dual Cortex-A72 + Dual Cortex-A53
+- Same memory map as MT8163
+- Compatible BROM protocol
+
+## Device Detection
+
+### USB Device Identification
+
+The exploit detects compatible devices via USB descriptor:
+
+```python
+VID = "0E8D"  # MediaTek Inc.
+PID = "0003"  # BROM mode
+```
+
+From `modules/common.py:13-14`
+
+### Device Enumeration
+
+```python
+def serial_ports():
+    """Lists available serial ports"""
+    result = set()
+    ports = list(serial.tools.list_ports.comports())
+    for port in ports:
+        portHwid = port.hwid
+        portDevice = port.device
+        
+        if VID in portHwid:  # Check for MediaTek VID
+            try:
+                s = serial.Serial(portDevice, timeout=TIMEOUT)
+                s.close()
+                result.add(port)
+            except (OSError, serial.SerialException):
+                pass
+    
+    return result
+```
+
+From `modules/common.py:20-52`
+
+### Boot Modes
+
+Devices can be in different boot modes:
+
+#### BROM Mode (Primary Target)
+
+```python
+if not PID in port.hwid:
+    self.preloader = True
+else:
+    self.preloader = False  # True BROM mode
+```
+
+**Characteristics:**
+- USB PID: `0x0003`
+- Direct BootROM access
+- Most vulnerable state
+- Activated by hardware boot failure
+
+From `modules/common.py:96-97`
+
+#### Preloader Mode (Alternative)
+
+```python
+if dev.preloader:
+    load_pl_payload(dev)  # Use preloader-specific payload
+else:
+    load_payload(dev)     # Use BROM payload
+```
+
+**Characteristics:**
+- USB PID: varies (often `0x2000`)
+- Preloader code running
+- Different exploit path required
+- Still exploitable via `pl.bin`
+
+From `modules/main.py:24-27`
+
+## Device-Specific Configuration
+
+### IDME Device Identification
+
+Amazon devices store configuration in the IDME partition:
+
+```python
+device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+
+log("Check device_type_id")
+if device_type_id == "AKPGW064GI9HE":
+    log("Detected mantis (" + device_type_id + ")")
+else:
+    log("Wrong device detected: " + device_type_id)
+    exit(1)
+```
+
+From `modules/main.py:29-36`
+
+### IDME Structure
+
+The IDME partition (eMMC partition 2) contains:
+
+```
+Offset 0x000: Magic "beefdeed" (8 bytes)
+Offset 0x008: IDME entries
+
+Each entry:
+  +0x00: Field name (16 bytes, null-terminated)
+  +0x10: Length (4 bytes)
+  +0x14: Reserved (12 bytes)
+  +0x20: Data (variable length)
+```
+
+**Common IDME Fields:**
+- `device_type_id`: Device model identifier
+- `serial`: Device serial number
+- `mac_addr`: WiFi MAC address
+- `board_id`: Hardware revision
+- `bootmode`: Boot configuration
+
+### Reading IDME from Python
+
+```python
+def idme_read(self, field_name):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x7000))  # IDME read command
+
+    if len(field_name) < 16:
+        field_name += b"\x00" * (16 - len(field_name))
+    self.dev.write(field_name)
+
+    size = int.from_bytes(self.dev.read(4), byteorder="big")
+    data = self.dev.read(size)
+    
+    if len(data) != size or data == to_bytes(0xffffffff, 4):
+        raise RuntimeError("read fail")
+    elif data == to_bytes(0xbeefdeed, 4):
+        raise RuntimeError("IDME invalid")
+    elif data == to_bytes(0xdeadbeef, 4):
+        log(field_name + " not found in IDME")
+        return None
+
+    return data
+```
+
+From `modules/common.py:281-303`
+
+## Known Compatible Devices
+
+### Amazon Fire HD 8 (2017) - "Mantis"
+
+**Device Type ID:** `AKPGW064GI9HE`
+
+**Chipset:** MediaTek MT8163
+
+**Model Numbers:**
+- Fire HD 8 (7th Generation)
+
+**Specifications:**
+- CPU: Quad-core ARM Cortex-A53 @ 1.3 GHz
+- RAM: 1.5 GB
+- Storage: 16/32 GB eMMC
+- BootROM: Vulnerable version
+
+**Partition Layout:**
+```
+Boot0 (4MB):
+  0x000000 - 0x080000: Preloader
+  0x080000 - 0x100000: LK Payload
+  0x200000 - 0x280000: LK Payload Backup
+
+User Partition:
+  lk: Little Kernel bootloader
+  tee1: TrustZone image
+  boot: Android boot image
+  recovery: Recovery image
+  MISC: Boot control
+  system: Android system
+```
+
+**Required Files:**
+- `gpt-mantis.bin`: Device-specific GPT
+- `preloader.img`: Vulnerable preloader
+- `lk.bin`: Vulnerable LK version
+- `tz.img`: Compatible TrustZone
+
+### Entering BROM Mode
+
+To trigger BROM mode on Fire tablets:
+
+1. **Power off device completely**
+2. **Short test points** (device-specific, requires disassembly)
+3. **Connect USB cable**
+4. **Power on while shorting**
+5. **Device enumerates as VID:0e8d PID:0003**
+
+Alternatively, from preloader mode:
+
+```python
+while dev.preloader:
+    log("Found device in preloader mode, trying to crash...")
+    dev.handshake()
+    dev.crash_pl()  # Crash preloader to fall back to BROM
+    dev.dev.close()
+    dev = Device()
+    dev.find_device()
+```
+
+From `modules/main.py:126-133`
+
+### Preloader Crash Method
+
+```python
+def crash_pl(self):
+    try:
+        # Send malformed payload to crash preloader
+        payload = b'\x00\x01\x9F\xE5\x10\xFF\x2F\xE1' + b'\x00' * 0x110
+        self.send_da(0, len(payload), 0, payload)
+        self.jump_da(0)
+    except RuntimeError as e:
+        log(e)
+```
+
+This deliberately crashes the preloader, forcing the device to fall back to BROM mode.
+
+From `modules/common.py:351-357`
+
+## Adding New Devices
+
+To port Kamakiri to a new MediaTek device:
+
+### 1. Verify Chipset Compatibility
+
+```bash
+# Check chipset via adb
+adb shell getprop ro.hardware
+# Should show mt8163 or mt8173
+
+# Check bootrom version
+adb shell cat /proc/cpuinfo
+```
+
+### 2. Extract Device Type ID
+
+```python
+# After exploit succeeds, read IDME
+device_type_id = dev.idme_read(b"device_type_id")
+print("Device Type ID:", device_type_id.decode('utf-8'))
+```
+
+### 3. Dump Original Partitions
+
+Before modifying:
+
+```python
+# Backup critical partitions
+backup_partition(dev, "preloader", gpt)
+backup_partition(dev, "lk", gpt)
+backup_partition(dev, "tee1", gpt)
+backup_partition(dev, "boot", gpt)
+```
+
+### 4. Update Device Check
+
+Modify `modules/main.py`:
+
+```python
+device_type_id = dev.idme_read(b"device_type_id").rstrip(b"\x00").decode("utf-8")
+
+if device_type_id == "AKPGW064GI9HE":
+    log("Detected mantis")
+    device_name = "mantis"
+elif device_type_id == "YOUR_DEVICE_ID":
+    log("Detected your_device")
+    device_name = "your_device"
+else:
+    log("Unknown device: " + device_type_id)
+    exit(1)
+
+# Load device-specific binaries
+flash_binary(dev, f"../bin/gpt-{device_name}.bin", ...)
+```
+
+### 5. Create Device-Specific Binaries
+
+You'll need:
+- Original vulnerable preloader
+- Original vulnerable LK binary
+- Compatible TrustZone image
+- Device-specific GPT layout
+
+### 6. Test LK Payload Addresses
+
+The LK payload uses hard-coded addresses that may vary:
+
+```c
+// These may need adjustment per device:
+struct device_t* (*get_device)() = (void*)0x41E22ED1;
+void (*cache_clean)(void *addr, size_t sz) = (void*)0x41E231E4;
+size_t (*video_printf)(const char *format, ...) = (void *)0x41E2790B;
+uint32_t* g_boot_mode = (uint32_t*) 0x41E5544C;
+```
+
+Find these addresses by:
+1. Disassembling the original LK binary
+2. Searching for function signatures
+3. Verifying with UART debug output
+
+## Device Not Supported?
+
+If your device has a different MediaTek chipset:
+
+### MT8127 / MT8167
+
+**Status:** Likely vulnerable (similar architecture)
+
+**Required Changes:**
+- Verify BROM protocol compatibility
+- Check memory map (may differ)
+- Test watchdog register addresses
+
+### MT6580 / MT6737 / MT6753
+
+**Status:** Different BootROM, requires new exploit research
+
+**Differences:**
+- Different BROM version
+- May have different vulnerabilities
+- Memory map differs significantly
+
+### MT6797 (Helio X20) and Newer
+
+**Status:** Not vulnerable to this exploit
+
+**Reasons:**
+- Updated BootROM with fixes
+- Enhanced security features
+- Different boot flow
+
+## Verification Steps
+
+Before running the exploit:
+
+### 1. Check USB Device
+
+```bash
+# Linux
+lsusb | grep 0e8d
+# Should show: Bus XXX Device XXX: ID 0e8d:0003 MediaTek Inc.
+
+# macOS
+system_profiler SPUSBDataType | grep -A 10 MediaTek
+```
+
+### 2. Verify Serial Connection
+
+```python
+import serial.tools.list_ports
+ports = list(serial.tools.list_ports.comports())
+for port in ports:
+    if "0E8D" in port.hwid:
+        print(f"Found device: {port.device}")
+        print(f"Hardware ID: {port.hwid}")
+```
+
+### 3. Test Handshake
+
+```python
+from common import Device
+
+dev = Device()
+dev.find_device()
+try:
+    dev.handshake()
+    print("Handshake successful!")
+except Exception as e:
+    print(f"Handshake failed: {e}")
+```
+
+### 4. Verify Memory Access
+
+```python
+# Read a safe register
+wdt_mode = dev.read32(0x10007000)
+print(f"WDT_MODE register: 0x{wdt_mode:08X}")
+
+# If this works, device is compatible
+```
+
+## Troubleshooting Device Detection
+
+### Device Not Found
+
+**Issue:** `Waiting for device` hangs forever
+
+**Solutions:**
+- Check USB cable (must support data, not just power)
+- Try different USB port
+- Disable ModemManager on Linux: `sudo systemctl stop ModemManager`
+- Check dmesg for USB errors: `dmesg | tail -20`
+
+### Wrong PID Detected
+
+**Issue:** Device shows different PID than `0x0003`
+
+**Solutions:**
+- Device may be in preloader mode (use crash method)
+- May need to short test points to force BROM mode
+- Check if device is in fastboot mode (wrong state)
+
+### Handshake Fails
+
+**Issue:** Device found but handshake times out
+
+**Solutions:**
+- Increase timeout: `TIMEOUT = 10` in `common.py`
+- Check baud rate (should be 115200)
+- Verify device is truly in BROM mode
+- Try power cycling device
+
+### IDME Read Fails
+
+**Issue:** Cannot read device_type_id
+
+**Solutions:**
+- IDME partition may be corrupted
+- Device may not be an Amazon device (no IDME)
+- Try reading other IDME fields to verify partition
+
+## Security Implications
+
+Devices vulnerable to Kamakiri:
+
+### Cannot Be Patched
+
+- BootROM is mask ROM (burned into silicon)
+- No software update can fix the vulnerability
+- Persists across factory resets
+- Only hardware revision can address it
+
+### Full Device Compromise
+
+- Bypass secure boot
+- Install persistent backdoors
+- Access encrypted data
+- Modify TrustZone
+- Full bootloader unlock
+
+### Mitigation Recommendations
+
+For device manufacturers:
+1. Hardware revision with fixed BootROM
+2. Additional boot stage verification
+3. Hardware security module (HSM) for attestation
+4. Fuse-based boot protection
+
+For end users:
+- Physical security is critical
+- Device with this chipset should not be used for high-security applications
+- Consider the device permanently compromised if physical access was possible

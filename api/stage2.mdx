@@ -1,0 +1,423 @@
+---
+title: 'Stage 2 Payload'
+description: 'Second-stage payload with MMC/eMMC storage access and advanced memory operations'
+---
+
+## Overview
+
+Stage 2 extends Stage 1 capabilities by adding MMC/eMMC storage access, RPMB operations, and IDME partition reading. It initializes the SD/MMC host controller and provides a comprehensive command protocol for device exploitation.
+
+**Source:** `brom-payload/stage2.c:4`
+
+## Initialization
+
+Stage 2 initializes the MMC/eMMC host controller:
+
+```c
+struct msdc_host host = { 0 };
+host.ocr_avail = MSDC_OCR_AVAIL;
+
+mmc_init(&host);
+```
+
+**Implementation:** `brom-payload/stage2.c:8-11`
+
+After initialization, it enters the command loop which sends handshake `0xB1B2B3B4`.
+
+## Protocol
+
+### Handshake
+
+```c
+send_dword(0xB1B2B3B4);
+```
+
+**Implementation:** `brom-payload/payload_common.c:49`
+
+### Command Format
+
+Identical to Stage 1:
+
+1. **Magic value:** `0xf00dd00d` (4 bytes)
+2. **Command code:** (4 bytes)
+3. **Command-specific parameters:** (variable)
+
+**Implementation:** `brom-payload/payload_common.c:51-58`
+
+## MMC/eMMC Commands
+
+### 0x1000: Read Block
+
+Reads a 512-byte block from eMMC storage.
+
+**Parameters:**
+- `block` (uint32_t): Block number to read
+
+**Response:**
+- 512 bytes of block data
+
+**Example:**
+```c
+// Read boot partition block 0
+send_dword(0xf00dd00d);
+send_dword(0x1000);
+send_dword(0x00000000);  // Block 0
+
+char buffer[512];
+recv_data(buffer, 512, 0);
+```
+
+**Implementation:** `brom-payload/payload_common.c:61-71`
+
+<Note>
+Block numbers are absolute addresses. Use command 0x1002 to switch between partitions (user data, boot0, boot1).
+</Note>
+
+### 0x1001: Write Block
+
+Writes a 512-byte block to eMMC storage.
+
+**Parameters:**
+- `block` (uint32_t): Block number to write
+- `data` (512 bytes): Block data
+
+**Response:**
+- `0xD0D0D0D0` on success
+
+**Example:**
+```c
+// Write modified boot block
+char modified_boot[512];
+// ... prepare data ...
+
+send_dword(0xf00dd00d);
+send_dword(0x1001);
+send_dword(0x00000100);  // Block 256
+send_data(modified_boot, 512);
+
+uint32_t response = recv_dword();
+if (response == 0xD0D0D0D0) {
+    printf("Write successful\n");
+}
+```
+
+**Implementation:** `brom-payload/payload_common.c:72-84`
+
+### 0x1002: Switch Partition
+
+Changes the active eMMC partition for subsequent read/write operations.
+
+**Parameters:**
+- `partition` (uint32_t): Partition number
+  - `0`: User data partition
+  - `1`: Boot partition 1
+  - `2`: Boot partition 2
+
+**Response:** None (500ms delay after switch)
+
+**Example:**
+```c
+// Switch to boot partition 1
+send_dword(0xf00dd00d);
+send_dword(0x1002);
+send_dword(0x00000001);
+
+// Now read/write commands target boot1
+```
+
+**Implementation:** `brom-payload/payload_common.c:85-92`
+
+<Note>
+A 500ms delay is enforced after partition switching to ensure the eMMC controller is ready.
+</Note>
+
+## RPMB Commands
+
+### 0x2000: Read RPMB
+
+Reads 256 bytes from the Replay Protected Memory Block.
+
+**Parameters:** None
+
+**Response:**
+- 256 bytes of RPMB data
+
+**Example:**
+```c
+send_dword(0xf00dd00d);
+send_dword(0x2000);
+
+char rpmb_data[256];
+recv_data(rpmb_data, 256, 0);
+```
+
+**Implementation:** `brom-payload/payload_common.c:93-98`
+
+### 0x2001: Write RPMB
+
+Writes 256 bytes to the RPMB partition.
+
+**Parameters:**
+- `data` (256 bytes): RPMB frame data
+
+**Response:** None
+
+**Example:**
+```c
+char rpmb_frame[256];
+// ... prepare authenticated RPMB frame ...
+
+send_dword(0xf00dd00d);
+send_dword(0x2001);
+send_data(rpmb_frame, 256, 0);
+```
+
+**Implementation:** `brom-payload/payload_common.c:99-104`
+
+<Note>
+RPMB operations require proper authentication frames. Writing to RPMB typically requires HMAC-SHA256 authentication with the device's secret key.
+</Note>
+
+## Memory Commands
+
+### 0x5000: Read Memory
+
+Reads arbitrary memory and sends it over USB.
+
+**Parameters:**
+- `address` (uint32_t): Memory address to read
+- `size` (uint32_t): Number of bytes to read
+
+**Response:**
+- Raw memory contents (aligned to 4-byte boundary)
+
+**Example:**
+```c
+// Dump bootROM from 0x00000000
+send_dword(0xf00dd00d);
+send_dword(0x5000);
+send_dword(0x00000000);
+send_dword(0x10000);  // 64KB
+
+char bootrom[0x10000];
+recv_data(bootrom, 0x10000, 0);
+```
+
+**Implementation:** `brom-payload/payload_common.c:105-111`
+
+<Note>
+Size is automatically rounded up to the nearest 4-byte boundary. Reading from invalid memory addresses may cause a fault.
+</Note>
+
+## IDME Commands
+
+### 0x7000: Read IDME Field
+
+Reads a specific field from Amazon's IDME partition (device metadata).
+
+**Parameters:**
+- `field_name` (16 bytes): Null-padded field name (e.g., "serial")
+
+**Response:**
+- `length` (uint32_t): Field data length
+- `data` (variable): Field contents
+
+**Special Error Codes:**
+- `0xffffffff`: Read error
+- `0xbeefdeed`: Invalid IDME partition
+- `0xdeadbeef`: Field not found
+
+**Example:**
+```c
+// Read device serial number
+char field_name[16] = "serial";
+
+send_dword(0xf00dd00d);
+send_dword(0x7000);
+send_data(field_name, 16, 0);
+
+uint32_t length = recv_dword();
+if (length != 0xffffffff && length != 0xbeefdeed && length != 0xdeadbeef) {
+    char *serial = malloc(length);
+    recv_data(serial, length, 0);
+    printf("Serial: %s\n", serial);
+}
+```
+
+**Implementation:** `brom-payload/payload_common.c:112-172`
+
+<Note>
+This command automatically switches to partition 2 (boot1) where IDME is typically stored. It validates the IDME header signature `"beefdeed"` at block 1.
+</Note>
+
+## System Commands
+
+### 0x3000: Reboot Device
+
+Triggers a hardware reboot using the watchdog timer.
+
+**Parameters:** None
+
+**Response:** None (device reboots)
+
+**Register Operations:**
+```c
+volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+reg[8/4] = 0x1971;       // Unlock watchdog
+reg[0/4] = 0x22000014;   // Configure watchdog
+reg[0x14/4] = 0x1209;    // Trigger reset
+```
+
+**Implementation:** `brom-payload/payload_common.c:173-183`
+
+### 0x3001: Kick Watchdog
+
+Resets the watchdog timer to prevent automatic reboot.
+
+**Parameters:** None
+
+**Response:** None
+
+**Implementation:** `brom-payload/payload_common.c:184-189`
+
+## Data Transfer Functions
+
+### send_data()
+
+Sends data over USB in 4-byte chunks with byte-swapping.
+
+```c
+void _send_data(char *addr, uint32_t sz) {
+    for (uint32_t i = 0; i < (((sz + 3) & ~3) / 4); i++) {
+        send_dword(__builtin_bswap32(((uint32_t *)addr)[i]));
+    }
+}
+```
+
+**Implementation:** `brom-payload/pl.c:31-35`
+
+### recv_data()
+
+Receives data over USB in 4-byte chunks with byte-swapping.
+
+```c
+void _recv_data(char *addr, uint32_t sz, uint32_t flags) {
+    for (uint32_t i = 0; i < (((sz + 3) & ~3) / 4); i++) {
+        ((uint32_t *)addr)[i] = __builtin_bswap32(recv_dword());
+    }
+}
+```
+
+**Implementation:** `brom-payload/pl.c:37-41`
+
+<Note>
+Both functions automatically round size up to the nearest 4-byte boundary and perform byte-swapping for endianness compatibility.
+</Note>
+
+## MMC Host Structure
+
+```c
+struct msdc_host {
+    // ... fields ...
+    uint32_t ocr_avail;  // Operating voltage range
+    // ... more fields ...
+};
+```
+
+The host is initialized with:
+```c
+host.ocr_avail = MSDC_OCR_AVAIL;
+```
+
+## Usage Example
+
+Complete exploit chain with Stage 2:
+
+```python
+import struct
+
+class Stage2:
+    def __init__(self, device):
+        self.dev = device
+        # Wait for handshake
+        handshake = struct.unpack('<I', device.read(4))[0]
+        assert handshake == 0xB4B3B2B1
+    
+    def read_block(self, block):
+        self.dev.write(struct.pack('<III', 0xf00dd00d, 0x1000, block))
+        return self.dev.read(512)
+    
+    def write_block(self, block, data):
+        self.dev.write(struct.pack('<III', 0xf00dd00d, 0x1001, block))
+        self.dev.write(data)
+        response = struct.unpack('<I', self.dev.read(4))[0]
+        return response == 0xD0D0D0D0
+    
+    def switch_partition(self, part):
+        self.dev.write(struct.pack('<III', 0xf00dd00d, 0x1002, part))
+        time.sleep(0.5)
+    
+    def read_memory(self, addr, size):
+        self.dev.write(struct.pack('<IIII', 0xf00dd00d, 0x5000, addr, size))
+        return self.dev.read(size)
+    
+    def read_idme(self, field):
+        field_bytes = field.encode().ljust(16, b'\x00')
+        self.dev.write(struct.pack('<II', 0xf00dd00d, 0x7000))
+        self.dev.write(field_bytes)
+        length = struct.unpack('<I', self.dev.read(4))[0]
+        if length in [0xffffffff, 0xbeefdeed, 0xdeadbeef]:
+            return None
+        return self.dev.read(length)
+
+# Usage
+stage2 = Stage2(usb_device)
+
+# Dump boot partition
+stage2.switch_partition(1)
+boot0_data = b''.join(stage2.read_block(i) for i in range(0x1000))
+
+# Read device serial
+serial = stage2.read_idme('serial')
+print(f'Serial: {serial.decode()}')
+```
+
+## Error Handling
+
+Stage 2 uses printf for verbose logging:
+
+```c
+if (mmc_read(host, block, buf) != 0) {
+    printf("Read error!\n");
+}
+```
+
+Protocol errors terminate the command loop:
+
+```c
+if (magic != 0xf00dd00d) {
+    printf("Protocol error\n");
+    printf("Magic received = 0x%08X\n", magic);
+    break;
+}
+```
+
+## Preloader Payload Variant
+
+The preloader payload (`pl.c`) is similar to Stage 2 but dynamically locates bootROM functions:
+
+```c
+// Pattern matching to find functions
+uint16_t send_dword_pattern[] = {0xB507, 0x0E03};
+uint16_t recv_dword_pattern[] = {0x4B0E, 0x2200};
+
+send_dword = (void *)(searchfunc(PRELOADER_BASE + 0x100, 
+                                  PRELOADER_BASE + 0x20000,
+                                  send_dword_pattern, 2) | 1);
+```
+
+**Implementation:** `brom-payload/pl.c:49-80`
+
+<Note>
+The preloader variant uses binary pattern matching to locate USB communication functions at runtime, making it more portable across different preloader versions.
+</Note>
